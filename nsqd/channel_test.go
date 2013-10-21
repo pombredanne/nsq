@@ -1,7 +1,7 @@
 package main
 
 import (
-	"../nsq"
+	"github.com/bitly/go-nsq"
 	"github.com/bmizerany/assert"
 	"io/ioutil"
 	"log"
@@ -63,23 +63,94 @@ func TestInFlightWorker(t *testing.T) {
 	defer log.SetOutput(os.Stdout)
 
 	options := NewNsqdOptions()
-	options.msgTimeout = 300 * time.Millisecond
+	options.msgTimeout = 200 * time.Millisecond
 	nsqd := NewNSQd(1, options)
 	defer nsqd.Exit()
 
-	topic := nsqd.GetTopic("topic")
+	topicName := "test_in_flight_worker" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
 	channel := topic.GetChannel("channel")
 
 	for i := 0; i < 1000; i++ {
 		msg := nsq.NewMessage(<-nsqd.idChan, []byte("test"))
-		channel.StartInFlightTimeout(msg, NewClientV2(nil))
+		channel.StartInFlightTimeout(msg, 0)
 	}
 
 	assert.Equal(t, len(channel.inFlightMessages), 1000)
 	assert.Equal(t, len(channel.inFlightPQ), 1000)
 
-	time.Sleep(350 * time.Millisecond)
+	// the in flight worker has a resolution of 100ms so we need to wait
+	// at least that much longer than our msgTimeout (in worst case)
+	time.Sleep(options.msgTimeout + 100*time.Millisecond)
 
 	assert.Equal(t, len(channel.inFlightMessages), 0)
 	assert.Equal(t, len(channel.inFlightPQ), 0)
+}
+
+func TestChannelEmpty(t *testing.T) {
+	log.SetOutput(ioutil.Discard)
+	defer log.SetOutput(os.Stdout)
+
+	nsqd := NewNSQd(1, NewNsqdOptions())
+	defer nsqd.Exit()
+
+	topicName := "test_channel_empty" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("channel")
+
+	msgs := make([]*nsq.Message, 0, 25)
+	for i := 0; i < 25; i++ {
+		msg := nsq.NewMessage(<-nsqd.idChan, []byte("test"))
+		channel.StartInFlightTimeout(msg, 0)
+		msgs = append(msgs, msg)
+	}
+
+	channel.RequeueMessage(0, msgs[len(msgs)-1].Id, 100*time.Millisecond)
+	assert.Equal(t, len(channel.inFlightMessages), 24)
+	assert.Equal(t, len(channel.inFlightPQ), 24)
+	assert.Equal(t, len(channel.deferredMessages), 1)
+	assert.Equal(t, len(channel.deferredPQ), 1)
+
+	channel.Empty()
+
+	assert.Equal(t, len(channel.inFlightMessages), 0)
+	assert.Equal(t, len(channel.inFlightPQ), 0)
+	assert.Equal(t, len(channel.deferredMessages), 0)
+	assert.Equal(t, len(channel.deferredPQ), 0)
+	assert.Equal(t, channel.Depth(), int64(0))
+}
+
+func TestChannelEmptyConsumer(t *testing.T) {
+	log.SetOutput(ioutil.Discard)
+	defer log.SetOutput(os.Stdout)
+
+	tcpAddr, _, nsqd := mustStartNSQd(NewNsqdOptions())
+	defer nsqd.Exit()
+	conn, _ := mustConnectNSQd(tcpAddr)
+
+	topicName := "test_channel_empty" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("channel")
+	client := NewClientV2(0, conn, &Context{nsqd})
+	client.SetReadyCount(25)
+	channel.AddClient(client.ID, client)
+
+	for i := 0; i < 25; i++ {
+		msg := nsq.NewMessage(<-nsqd.idChan, []byte("test"))
+		channel.StartInFlightTimeout(msg, 0)
+		client.SendingMessage()
+	}
+
+	for _, cl := range channel.clients {
+		stats := cl.Stats()
+		assert.Equal(t, stats.InFlightCount, int64(25))
+	}
+
+	channel.Empty()
+
+	for _, cl := range channel.clients {
+		stats := cl.Stats()
+		assert.Equal(t, stats.InFlightCount, int64(0))
+	}
+
 }

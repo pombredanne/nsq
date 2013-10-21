@@ -1,12 +1,14 @@
 package main
 
 import (
-	"../util"
 	"flag"
+	"fmt"
+	"github.com/bitly/nsq/util"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"time"
 )
 
 var (
@@ -16,6 +18,8 @@ var (
 	graphiteUrl              = flag.String("graphite-url", "", "URL to graphite HTTP address")
 	proxyGraphite            = flag.Bool("proxy-graphite", false, "Proxy HTTP requests to graphite")
 	useStatsdPrefixes        = flag.Bool("use-statsd-prefixes", true, "expect statsd prefixed keys in graphite (ie: 'stats_counts.')")
+	statsdPrefix             = flag.String("statsd-prefix", "nsq.%s", "prefix used for keys sent to statsd (%s for host replacement, must match nsqd)")
+	statsdInterval           = flag.Duration("statsd-interval", 60*time.Second, "time interval nsqd is configured to push to statsd (must match nsqd)")
 	lookupdHTTPAddrs         = util.StringArray{}
 	nsqdHTTPAddrs            = util.StringArray{}
 	notificationHTTPEndpoint = flag.String("notification-http-endpoint", "", "HTTP endpoint (fully qualified) to which POST notifications of admin actions will be sent")
@@ -33,8 +37,8 @@ func main() {
 
 	flag.Parse()
 
-	log.Printf("nsqadmin v%s", util.BINARY_VERSION)
 	if *showVersion {
+		fmt.Println(util.Version("nsqadmin"))
 		return
 	}
 
@@ -58,6 +62,8 @@ func main() {
 	if len(nsqdHTTPAddrs) != 0 && len(lookupdHTTPAddrs) != 0 {
 		log.Fatalf("use --nsqd-http-address or --lookupd-http-address not both")
 	}
+
+	log.Println(util.Version("nsqadmin"))
 
 	exitChan := make(chan int)
 	signalChan := make(chan os.Signal, 1)

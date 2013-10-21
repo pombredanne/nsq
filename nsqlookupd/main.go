@@ -1,10 +1,9 @@
 package main
 
 import (
-	"../nsq"
-	"../util"
 	"flag"
 	"fmt"
+	"github.com/bitly/nsq/util"
 	"log"
 	"net"
 	"os"
@@ -19,16 +18,22 @@ var (
 	verbose                 = flag.Bool("verbose", false, "enable verbose logging")
 	inactiveProducerTimeout = flag.Duration("inactive-producer-timeout", 300*time.Second, "duration of time a producer will remain in the active list since its last ping")
 	tombstoneLifetime       = flag.Duration("tombstone-lifetime", 45*time.Second, "duration of time a producer will remain tombstoned if registration remains")
+	broadcastAddress        = flag.String("broadcast-address", "", "address of this lookupd node, (default to the OS hostname)")
 )
-
-var protocols = map[int32]nsq.Protocol{}
-var lookupd *NSQLookupd
 
 func main() {
 	flag.Parse()
 
+	if *broadcastAddress == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			log.Fatal(err)
+		}
+		*broadcastAddress = hostname
+	}
+
 	if *showVersion {
-		fmt.Printf("nsqlookupd v%s\n", util.BINARY_VERSION)
+		fmt.Println(util.Version("nsqlookupd"))
 		return
 	}
 
@@ -50,14 +55,15 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Printf("nsqlookupd v%s", util.BINARY_VERSION)
+	log.Println(util.Version("nsqlookupd"))
 
-	lookupd = NewNSQLookupd()
-	lookupd.tcpAddr = tcpAddr
-	lookupd.httpAddr = httpAddr
-	lookupd.inactiveProducerTimeout = *inactiveProducerTimeout
-	lookupd.tombstoneLifetime = *tombstoneLifetime
-	lookupd.Main()
+	nsqlookupd := NewNSQLookupd()
+	nsqlookupd.tcpAddr = tcpAddr
+	nsqlookupd.httpAddr = httpAddr
+	nsqlookupd.broadcastAddress = *broadcastAddress
+	nsqlookupd.inactiveProducerTimeout = *inactiveProducerTimeout
+	nsqlookupd.tombstoneLifetime = *tombstoneLifetime
+	nsqlookupd.Main()
 	<-exitChan
-	lookupd.Exit()
+	nsqlookupd.Exit()
 }

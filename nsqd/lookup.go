@@ -1,10 +1,10 @@
 package main
 
 import (
-	"../nsq"
-	"../util"
 	"bytes"
 	"encoding/json"
+	"github.com/bitly/go-nsq"
+	"github.com/bitly/nsq/util"
 	"log"
 	"net"
 	"os"
@@ -13,7 +13,7 @@ import (
 )
 
 func (n *NSQd) lookupLoop() {
-	syncTopicChan := make(chan *nsq.LookupPeer)
+	syncTopicChan := make(chan *LookupPeer)
 
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -22,12 +22,15 @@ func (n *NSQd) lookupLoop() {
 
 	for _, host := range n.lookupdTCPAddrs {
 		log.Printf("LOOKUP: adding peer %s", host)
-		lookupPeer := nsq.NewLookupPeer(host, func(lp *nsq.LookupPeer) {
+		lookupPeer := NewLookupPeer(host, func(lp *LookupPeer) {
 			ci := make(map[string]interface{})
 			ci["version"] = util.BINARY_VERSION
 			ci["tcp_port"] = n.tcpAddr.Port
 			ci["http_port"] = n.httpAddr.Port
-			ci["address"] = hostname
+			ci["address"] = hostname //TODO: drop for 1.0
+			ci["hostname"] = hostname
+			ci["broadcast_address"] = n.options.broadcastAddress
+
 			cmd, err := nsq.Identify(ci)
 			if err != nil {
 				lp.Close()
@@ -104,8 +107,8 @@ func (n *NSQd) lookupLoop() {
 		case lookupPeer := <-syncTopicChan:
 			commands := make([]*nsq.Command, 0)
 			// build all the commands first so we exit the lock(s) as fast as possible
-			nsqd.RLock()
-			for _, topic := range nsqd.topicMap {
+			n.RLock()
+			for _, topic := range n.topicMap {
 				topic.RLock()
 				if len(topic.channelMap) == 0 {
 					commands = append(commands, nsq.Register(topic.name, ""))
@@ -116,7 +119,7 @@ func (n *NSQd) lookupLoop() {
 				}
 				topic.RUnlock()
 			}
-			nsqd.RUnlock()
+			n.RUnlock()
 
 			for _, cmd := range commands {
 				log.Printf("LOOKUPD(%s): %s", lookupPeer, cmd)
@@ -138,10 +141,16 @@ exit:
 func (n *NSQd) lookupHttpAddrs() []string {
 	var lookupHttpAddrs []string
 	for _, lp := range n.lookupPeers {
-		if len(lp.Info.Address) <= 0 {
+
+		//TODO: remove for 1.0
+		if len(lp.Info.BroadcastAddress) <= 0 {
+			lp.Info.BroadcastAddress = lp.Info.Address
+		}
+
+		if len(lp.Info.BroadcastAddress) <= 0 {
 			continue
 		}
-		addr := net.JoinHostPort(lp.Info.Address, strconv.Itoa(lp.Info.HttpPort))
+		addr := net.JoinHostPort(lp.Info.BroadcastAddress, strconv.Itoa(lp.Info.HttpPort))
 		lookupHttpAddrs = append(lookupHttpAddrs, addr)
 	}
 	return lookupHttpAddrs

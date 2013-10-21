@@ -16,15 +16,22 @@ type Registration struct {
 	Key      string
 	SubKey   string
 }
-type Registrations []*Registration
+type Registrations []Registration
+
+type PeerInfo struct {
+	id               string
+	RemoteAddress    string `json:"remote_address"`
+	Address          string `json:"address"` //TODO: drop for 1.0
+	Hostname         string `json:"hostname"`
+	BroadcastAddress string `json:"broadcast_address"`
+	TcpPort          int    `json:"tcp_port"`
+	HttpPort         int    `json:"http_port"`
+	Version          string `json:"version"`
+	lastUpdate       time.Time
+}
 
 type Producer struct {
-	producerId   string
-	Address      string    `json:"address"`
-	TcpPort      int       `json:"tcp_port"`
-	HttpPort     int       `json:"http_port"`
-	Version      string    `json:"version"`
-	LastUpdate   time.Time `json:"-"`
+	peerInfo     *PeerInfo
 	tombstoned   bool
 	tombstonedAt time.Time
 }
@@ -32,7 +39,7 @@ type Producer struct {
 type Producers []*Producer
 
 func (p *Producer) String() string {
-	return fmt.Sprintf("%s [%d, %d]", p.Address, p.TcpPort, p.HttpPort)
+	return fmt.Sprintf("%s [%d, %d]", p.peerInfo.BroadcastAddress, p.peerInfo.TcpPort, p.peerInfo.HttpPort)
 }
 
 func (p *Producer) Tombstone() {
@@ -67,7 +74,7 @@ func (r *RegistrationDB) AddProducer(k Registration, p *Producer) bool {
 	producers := r.registrationMap[k]
 	found := false
 	for _, producer := range producers {
-		if producer.producerId == p.producerId {
+		if producer.peerInfo.id == p.peerInfo.id {
 			found = true
 		}
 	}
@@ -78,7 +85,7 @@ func (r *RegistrationDB) AddProducer(k Registration, p *Producer) bool {
 }
 
 // remove a producer from a registration
-func (r *RegistrationDB) RemoveProducer(k Registration, p *Producer) (bool, int) {
+func (r *RegistrationDB) RemoveProducer(k Registration, id string) (bool, int) {
 	r.Lock()
 	defer r.Unlock()
 	producers, ok := r.registrationMap[k]
@@ -88,7 +95,7 @@ func (r *RegistrationDB) RemoveProducer(k Registration, p *Producer) (bool, int)
 	removed := false
 	cleaned := make(Producers, 0)
 	for _, producer := range producers {
-		if producer != p { // this is a pointer comparison
+		if producer.peerInfo.id != id {
 			cleaned = append(cleaned, producer)
 		} else {
 			removed = true
@@ -110,12 +117,11 @@ func (r *RegistrationDB) FindRegistrations(category string, key string, subkey s
 	r.RLock()
 	defer r.RUnlock()
 	results := make(Registrations, 0)
-	for k, _ := range r.registrationMap {
+	for k := range r.registrationMap {
 		if !k.IsMatch(category, key, subkey) {
 			continue
 		}
-		// strangely, we can't just return &k because k here is a copy and a local variable
-		results = append(results, &Registration{k.Category, k.Key, k.SubKey})
+		results = append(results, k)
 	}
 	return results
 }
@@ -131,7 +137,7 @@ func (r *RegistrationDB) FindProducers(category string, key string, subkey strin
 		for _, producer := range producers {
 			found := false
 			for _, p := range results {
-				if producer.producerId == p.producerId {
+				if producer.peerInfo.id == p.peerInfo.id {
 					found = true
 				}
 			}
@@ -143,15 +149,14 @@ func (r *RegistrationDB) FindProducers(category string, key string, subkey strin
 	return results
 }
 
-func (r *RegistrationDB) LookupRegistrations(p *Producer) Registrations {
+func (r *RegistrationDB) LookupRegistrations(id string) Registrations {
 	r.RLock()
 	defer r.RUnlock()
 	results := make(Registrations, 0)
 	for k, producers := range r.registrationMap {
-		for _, producer := range producers {
-			if producer.producerId == p.producerId {
-				// strangely, we can't just return &k because k here is a copy and a local variable
-				results = append(results, &Registration{k.Category, k.Key, k.SubKey})
+		for _, p := range producers {
+			if p.peerInfo.id == id {
+				results = append(results, k)
 				break
 			}
 		}
@@ -202,10 +207,18 @@ func (pp Producers) FilterByActive(inactivityTimeout time.Duration, tombstoneLif
 	now := time.Now()
 	results := make(Producers, 0)
 	for _, p := range pp {
-		if now.Sub(p.LastUpdate) > inactivityTimeout || p.IsTombstoned(tombstoneLifetime) {
+		if now.Sub(p.peerInfo.lastUpdate) > inactivityTimeout || p.IsTombstoned(tombstoneLifetime) {
 			continue
 		}
 		results = append(results, p)
+	}
+	return results
+}
+
+func (pp Producers) PeerInfo() []*PeerInfo {
+	results := make([]*PeerInfo, 0)
+	for _, p := range pp {
+		results = append(results, p.peerInfo)
 	}
 	return results
 }

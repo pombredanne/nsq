@@ -1,12 +1,14 @@
 package main
 
 import (
-	"../nsq"
-	"../util"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/bitly/go-nsq"
 	"github.com/bitly/go-simplejson"
+	"github.com/bitly/nsq/util"
+	"github.com/bitly/nsq/util/lookupd"
 	"io/ioutil"
 	"log"
 	"net"
@@ -17,48 +19,102 @@ import (
 	"time"
 )
 
-type Notifier interface {
-	Notify(v interface{})
-}
-
 type NSQd struct {
+	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
+	workerId         int64
+	clientIDSequence int64
+
 	sync.RWMutex
-	options         *nsqdOptions
-	workerId        int64
-	topicMap        map[string]*Topic
+
+	options *nsqdOptions
+
+	topicMap map[string]*Topic
+
 	lookupdTCPAddrs util.StringArray
-	tcpAddr         *net.TCPAddr
-	httpAddr        *net.TCPAddr
-	tcpListener     net.Listener
-	httpListener    net.Listener
-	idChan          chan nsq.MessageID
-	exitChan        chan int
-	waitGroup       util.WaitGroupWrapper
-	lookupPeers     []*nsq.LookupPeer
-	notifyChan      chan interface{}
+	lookupPeers     []*LookupPeer
+
+	tcpAddr      *net.TCPAddr
+	httpAddr     *net.TCPAddr
+	tcpListener  net.Listener
+	httpListener net.Listener
+	tlsConfig    *tls.Config
+
+	idChan     chan nsq.MessageID
+	notifyChan chan interface{}
+	exitChan   chan int
+	waitGroup  util.WaitGroupWrapper
 }
 
 type nsqdOptions struct {
-	memQueueSize    int64
+	// basic options
+	broadcastAddress string
+
+	// diskqueue options
 	dataPath        string
-	maxMessageSize  int64
-	maxBodySize     int64
+	memQueueSize    int64
 	maxBytesPerFile int64
 	syncEvery       int64
-	msgTimeout      time.Duration
-	clientTimeout   time.Duration
+	syncTimeout     time.Duration
+
+	// msg and command options
+	msgTimeout     time.Duration
+	maxMsgTimeout  time.Duration
+	maxMessageSize int64
+	maxBodySize    int64
+	clientTimeout  time.Duration
+
+	// client overridable configuration options
+	maxHeartbeatInterval   time.Duration
+	maxRdyCount            int64
+	maxOutputBufferSize    int64
+	maxOutputBufferTimeout time.Duration
+
+	// statsd integration
+	statsdAddress  string
+	statsdPrefix   string
+	statsdInterval time.Duration
+
+	// TLS config
+	tlsCert string
+	tlsKey  string
+
+	// compression
+	deflateEnabled  bool
+	maxDeflateLevel int
+	snappyEnabled   bool
 }
 
 func NewNsqdOptions() *nsqdOptions {
 	return &nsqdOptions{
-		memQueueSize:    10000,
+		broadcastAddress: "",
+
 		dataPath:        os.TempDir(),
-		maxMessageSize:  1024768,
-		maxBodySize:     5 * 1024768,
+		memQueueSize:    10000,
 		maxBytesPerFile: 104857600,
 		syncEvery:       2500,
-		msgTimeout:      60 * time.Second,
-		clientTimeout:   nsq.DefaultClientTimeout,
+		syncTimeout:     2 * time.Second,
+
+		msgTimeout:     60 * time.Second,
+		maxMsgTimeout:  15 * time.Minute,
+		maxMessageSize: 1024768,
+		maxBodySize:    5 * 1024768,
+		clientTimeout:  nsq.DefaultClientTimeout,
+
+		maxHeartbeatInterval:   60 * time.Second,
+		maxRdyCount:            2500,
+		maxOutputBufferSize:    64 * 1024,
+		maxOutputBufferTimeout: 1 * time.Second,
+
+		statsdAddress:  "",
+		statsdPrefix:   "",
+		statsdInterval: 60 * time.Second,
+
+		tlsCert: "",
+		tlsKey:  "",
+
+		deflateEnabled:  true,
+		maxDeflateLevel: -1,
+		snappyEnabled:   true,
 	}
 }
 
@@ -72,12 +128,26 @@ func NewNSQd(workerId int64, options *nsqdOptions) *NSQd {
 		notifyChan: make(chan interface{}),
 	}
 
+	if options.tlsCert != "" || options.tlsKey != "" {
+		cert, err := tls.LoadX509KeyPair(options.tlsCert, options.tlsKey)
+		if err != nil {
+			log.Fatalf("ERROR: failed to LoadX509KeyPair %s", err.Error())
+		}
+		n.tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			ClientAuth:   tls.VerifyClientCertIfGiven,
+		}
+		n.tlsConfig.BuildNameToCertificate()
+	}
+
 	n.waitGroup.Wrap(func() { n.idPump() })
 
 	return n
 }
 
 func (n *NSQd) Main() {
+	context := &Context{n}
+
 	n.waitGroup.Wrap(func() { n.lookupLoop() })
 
 	tcpListener, err := net.Listen("tcp", n.tcpAddr.String())
@@ -85,14 +155,20 @@ func (n *NSQd) Main() {
 		log.Fatalf("FATAL: listen (%s) failed - %s", n.tcpAddr, err.Error())
 	}
 	n.tcpListener = tcpListener
-	n.waitGroup.Wrap(func() { util.TcpServer(n.tcpListener, &TcpProtocol{protocols: protocols}) })
+	tcpServer := &tcpServer{context: context}
+	n.waitGroup.Wrap(func() { util.TCPServer(n.tcpListener, tcpServer) })
 
 	httpListener, err := net.Listen("tcp", n.httpAddr.String())
 	if err != nil {
 		log.Fatalf("FATAL: listen (%s) failed - %s", n.httpAddr, err.Error())
 	}
 	n.httpListener = httpListener
-	n.waitGroup.Wrap(func() { httpServer(n.httpListener) })
+	httpServer := &httpServer{context: context}
+	n.waitGroup.Wrap(func() { util.HTTPServer(n.httpListener, httpServer) })
+
+	if n.options.statsdAddress != "" {
+		n.waitGroup.Wrap(func() { n.statsdLoop() })
+	}
 }
 
 func (n *NSQd) LoadMetadata() {
@@ -117,7 +193,7 @@ func (n *NSQd) LoadMetadata() {
 		return
 	}
 
-	for ti, _ := range topics {
+	for ti := range topics {
 		topicJs := js.Get("topics").GetIndex(ti)
 
 		topicName, err := topicJs.Get("name").String()
@@ -137,7 +213,7 @@ func (n *NSQd) LoadMetadata() {
 			return
 		}
 
-		for ci, _ := range channels {
+		for ci := range channels {
 			channelJs := topicJs.Get("channels").GetIndex(ci)
 
 			channelName, err := channelJs.Get("name").String()
@@ -159,7 +235,7 @@ func (n *NSQd) LoadMetadata() {
 	}
 }
 
-func (n *NSQd) PersistMetadata() {
+func (n *NSQd) PersistMetadata() error {
 	// persist metadata about what topics/channels we have
 	// so that upon restart we can get back to the same state
 	fileName := fmt.Sprintf(path.Join(n.options.dataPath, "nsqd.%d.dat"), n.workerId)
@@ -191,30 +267,29 @@ func (n *NSQd) PersistMetadata() {
 
 	data, err := json.Marshal(&js)
 	if err != nil {
-		log.Printf("ERROR: failed to marshal JSON metadata - %s", err.Error())
-		return
+		return err
 	}
 
 	tmpFileName := fileName + ".tmp"
 	f, err := os.OpenFile(tmpFileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		log.Printf("ERROR: failed to open temporary metadata file %s - %s", tmpFileName, err.Error())
-		return
+		return err
 	}
 
 	_, err = f.Write(data)
 	if err != nil {
-		log.Printf("ERROR: failed to write to temporary metadata file %s - %s", tmpFileName, err.Error())
 		f.Close()
-		return
+		return err
 	}
 	f.Sync()
 	f.Close()
 
 	err = os.Rename(tmpFileName, fileName)
 	if err != nil {
-		log.Printf("ERROR: failed to rename temporary metadata file %s to %s - %s", tmpFileName, fileName, err.Error())
+		return err
 	}
+
+	return nil
 }
 
 func (n *NSQd) Exit() {
@@ -227,7 +302,10 @@ func (n *NSQd) Exit() {
 	}
 
 	n.Lock()
-	n.PersistMetadata()
+	err := n.PersistMetadata()
+	if err != nil {
+		log.Printf("ERROR: failed to persist metadata - %s", err.Error())
+	}
 	log.Printf("NSQ: closing topics")
 	for _, topic := range n.topicMap {
 		topic.Close()
@@ -249,22 +327,34 @@ func (n *NSQd) GetTopic(topicName string) *Topic {
 		n.Unlock()
 		return t
 	} else {
-		t = NewTopic(topicName, n.options, n)
+		t = NewTopic(topicName, &Context{n})
 		n.topicMap[topicName] = t
+
 		log.Printf("TOPIC(%s): created", t.name)
 
 		// release our global nsqd lock, and switch to a more granular topic lock while we init our
 		// channels from lookupd. This blocks concurrent PutMessages to this topic.
 		t.Lock()
-		defer t.Unlock()
 		n.Unlock()
 		// if using lookupd, make a blocking call to get the topics, and immediately create them.
 		// this makes sure that any message received is buffered to the right channels
 		if len(n.lookupPeers) > 0 {
-			channelNames, _ := util.GetChannelsForTopic(t.name, n.lookupHttpAddrs())
+			channelNames, _ := lookupd.GetLookupdTopicChannels(t.name, n.lookupHttpAddrs())
 			for _, channelName := range channelNames {
 				t.getOrCreateChannel(channelName)
 			}
+		}
+		t.Unlock()
+
+		// NOTE: I would prefer for this to only happen in topic.GetChannel() but we're special
+		// casing the code above so that we can control the locks such that it is impossible
+		// for a message to be written to a (new) topic while we're looking up channels
+		// from lookupd...
+		//
+		// update messagePump state
+		select {
+		case t.channelUpdateChan <- 1:
+		case <-t.exitChan:
 		}
 	}
 	return t
@@ -283,21 +373,25 @@ func (n *NSQd) GetExistingTopic(topicName string) (*Topic, error) {
 
 // DeleteExistingTopic removes a topic only if it exists
 func (n *NSQd) DeleteExistingTopic(topicName string) error {
-	n.Lock()
+	n.RLock()
 	topic, ok := n.topicMap[topicName]
 	if !ok {
-		n.Unlock()
+		n.RUnlock()
 		return errors.New("topic does not exist")
 	}
-	delete(n.topicMap, topicName)
-	// not defered so that we can continue while the topic async closes
-	n.Unlock()
-
-	log.Printf("TOPIC(%s): deleting", topic.name)
+	n.RUnlock()
 
 	// delete empties all channels and the topic itself before closing
 	// (so that we dont leave any messages around)
+	//
+	// we do this before removing the topic from map below (with no lock)
+	// so that any incoming writes will error and not create a new topic
+	// to enforce ordering
 	topic.Delete()
+
+	n.Lock()
+	delete(n.topicMap, topicName)
+	n.Unlock()
 
 	return nil
 }
@@ -333,5 +427,11 @@ func (n *NSQd) Notify(v interface{}) {
 	select {
 	case <-n.exitChan:
 	case n.notifyChan <- v:
+		n.Lock()
+		err := n.PersistMetadata()
+		if err != nil {
+			log.Printf("ERROR: failed to persist metadata - %s", err.Error())
+		}
+		n.Unlock()
 	}
 }

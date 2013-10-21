@@ -1,8 +1,8 @@
 package util
 
 import (
-	"../nsq"
 	"errors"
+	"github.com/bitly/go-nsq"
 )
 
 type Getter interface {
