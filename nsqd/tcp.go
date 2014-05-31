@@ -1,15 +1,15 @@
-package main
+package nsqd
 
 import (
-	"github.com/bitly/go-nsq"
-	"github.com/bitly/nsq/util"
 	"io"
 	"log"
 	"net"
+
+	"github.com/bitly/nsq/util"
 )
 
 type tcpServer struct {
-	context *Context
+	context *context
 }
 
 func (p *tcpServer) Handle(clientConn net.Conn) {
@@ -31,9 +31,9 @@ func (p *tcpServer) Handle(clientConn net.Conn) {
 	var prot util.Protocol
 	switch protocolMagic {
 	case "  V2":
-		prot = &ProtocolV2{context: p.context}
+		prot = &protocolV2{context: p.context}
 	default:
-		util.SendFramedResponse(clientConn, nsq.FrameTypeError, []byte("E_BAD_PROTOCOL"))
+		util.SendFramedResponse(clientConn, frameTypeError, []byte("E_BAD_PROTOCOL"))
 		clientConn.Close()
 		log.Printf("ERROR: client(%s) bad protocol magic '%s'", clientConn.RemoteAddr(), protocolMagic)
 		return

@@ -1,39 +1,45 @@
 package main
 
 import (
-	"crypto/tls"
 	"flag"
 	"fmt"
-	"github.com/bitly/go-nsq"
-	"github.com/bitly/nsq/util"
 	"log"
 	"math/rand"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/bitly/go-nsq"
+	"github.com/bitly/nsq/util"
 )
 
 var (
-	showVersion      = flag.Bool("version", false, "print version string")
-	topic            = flag.String("topic", "", "nsq topic")
-	channel          = flag.String("channel", "", "nsq channel")
-	maxInFlight      = flag.Int("max-in-flight", 200, "max number of messages to allow in flight")
+	showVersion = flag.Bool("version", false, "print version string")
+
+	topic         = flag.String("topic", "", "nsq topic")
+	channel       = flag.String("channel", "", "nsq channel")
+	maxInFlight   = flag.Int("max-in-flight", 200, "max number of messages to allow in flight")
+	totalMessages = flag.Int("n", 0, "total messages to show (will wait if starved)")
+
+	readerOpts       = util.StringArray{}
 	nsqdTCPAddrs     = util.StringArray{}
 	lookupdHTTPAddrs = util.StringArray{}
-
-	tlsEnabled            = flag.Bool("tls", false, "enable TLS")
-	tlsInsecureSkipVerify = flag.Bool("tls-insecure-skip-verify", false, "disable TLS server certificate validation")
 )
 
 func init() {
+	flag.Var(&readerOpts, "reader-opt", "option to passthrough to nsq.Consumer (may be given multiple times)")
 	flag.Var(&nsqdTCPAddrs, "nsqd-tcp-address", "nsqd TCP address (may be given multiple times)")
 	flag.Var(&lookupdHTTPAddrs, "lookupd-http-address", "lookupd HTTP address (may be given multiple times)")
 }
 
-type TailHandler struct{}
+type TailHandler struct {
+	totalMessages int
+	messagesShown int
+}
 
 func (th *TailHandler) HandleMessage(m *nsq.Message) error {
+	th.messagesShown++
 	_, err := os.Stdout.Write(m.Body)
 	if err != nil {
 		log.Fatalf("ERROR: failed to write to os.Stdout - %s", err.Error())
@@ -41,6 +47,9 @@ func (th *TailHandler) HandleMessage(m *nsq.Message) error {
 	_, err = os.Stdout.WriteString("\n")
 	if err != nil {
 		log.Fatalf("ERROR: failed to write to os.Stdout - %s", err.Error())
+	}
+	if th.totalMessages > 0 && th.messagesShown >= th.totalMessages {
+		os.Exit(0)
 	}
 	return nil
 }
@@ -62,10 +71,6 @@ func main() {
 		log.Fatalf("--topic is required")
 	}
 
-	if *maxInFlight <= 0 {
-		log.Fatalf("--max-in-flight must be > 0")
-	}
-
 	if len(nsqdTCPAddrs) == 0 && len(lookupdHTTPAddrs) == 0 {
 		log.Fatalf("--nsqd-tcp-address or --lookupd-http-address required")
 	}
@@ -76,22 +81,29 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	r, err := nsq.NewReader(*topic, *channel)
+	// Don't ask for more messages than we want
+	if *totalMessages > 0 && *totalMessages < *maxInFlight {
+		*maxInFlight = *totalMessages
+	}
+
+	cfg := nsq.NewConfig()
+	cfg.Set("max_in_flight", *maxInFlight)
+
+	err := util.ParseReaderOpts(cfg, readerOpts)
 	if err != nil {
 		log.Fatalf(err.Error())
 	}
-	r.SetMaxInFlight(*maxInFlight)
-	r.AddHandler(&TailHandler{})
 
-	if *tlsEnabled {
-		r.TLSv1 = true
-		r.TLSConfig = &tls.Config{
-			InsecureSkipVerify: *tlsInsecureSkipVerify,
-		}
+	r, err := nsq.NewConsumer(*topic, *channel, cfg)
+	if err != nil {
+		log.Fatalf(err.Error())
 	}
+	r.SetLogger(log.New(os.Stderr, "", log.LstdFlags), nsq.LogLevelInfo)
+
+	r.SetHandler(&TailHandler{totalMessages: *totalMessages})
 
 	for _, addrString := range nsqdTCPAddrs {
-		err := r.ConnectToNSQ(addrString)
+		err := r.ConnectToNSQD(addrString)
 		if err != nil {
 			log.Fatalf(err.Error())
 		}
@@ -99,7 +111,7 @@ func main() {
 
 	for _, addrString := range lookupdHTTPAddrs {
 		log.Printf("lookupd addr %s", addrString)
-		err := r.ConnectToLookupd(addrString)
+		err := r.ConnectToNSQLookupd(addrString)
 		if err != nil {
 			log.Fatalf(err.Error())
 		}
@@ -107,7 +119,7 @@ func main() {
 
 	for {
 		select {
-		case <-r.ExitChan:
+		case <-r.StopChan:
 			return
 		case <-sigChan:
 			r.Stop()

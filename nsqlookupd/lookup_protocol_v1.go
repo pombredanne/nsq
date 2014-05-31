@@ -1,18 +1,18 @@
-package main
+package nsqlookupd
 
 import (
 	"bufio"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"github.com/bitly/go-nsq"
-	"github.com/bitly/nsq/util"
 	"io"
 	"log"
 	"net"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/bitly/nsq/util"
 )
 
 type LookupProtocolV1 struct {
@@ -101,11 +101,11 @@ func getTopicChan(command string, params []string) (string, string, error) {
 		channelName = params[1]
 	}
 
-	if !nsq.IsValidTopicName(topicName) {
+	if !util.IsValidTopicName(topicName) {
 		return "", "", util.NewFatalClientErr(nil, "E_BAD_TOPIC", fmt.Sprintf("%s topic name '%s' is not valid", command, topicName))
 	}
 
-	if channelName != "" && !nsq.IsValidChannelName(channelName) {
+	if channelName != "" && !util.IsValidChannelName(channelName) {
 		return "", "", util.NewFatalClientErr(nil, "E_BAD_CHANNEL", fmt.Sprintf("%s channel name '%s' is not valid", command, channelName))
 	}
 
@@ -209,10 +209,6 @@ func (p *LookupProtocolV1) IDENTIFY(client *ClientV1, reader *bufio.Reader, para
 	}
 
 	peerInfo.RemoteAddress = client.RemoteAddr().String()
-	//TODO: remove this check for 1.0
-	if peerInfo.BroadcastAddress == "" {
-		peerInfo.BroadcastAddress = peerInfo.Address
-	}
 
 	// require all fields
 	if peerInfo.BroadcastAddress == "" || peerInfo.TcpPort == 0 || peerInfo.HttpPort == 0 || peerInfo.Version == "" {
@@ -238,8 +234,7 @@ func (p *LookupProtocolV1) IDENTIFY(client *ClientV1, reader *bufio.Reader, para
 	if err != nil {
 		log.Fatalf("ERROR: unable to get hostname %s", err.Error())
 	}
-	data["address"] = hostname //TODO: remove for 1.0
-	data["broadcast_address"] = p.context.nsqlookupd.broadcastAddress
+	data["broadcast_address"] = p.context.nsqlookupd.options.BroadcastAddress
 	data["hostname"] = hostname
 
 	response, err := json.Marshal(data)

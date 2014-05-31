@@ -1,35 +1,35 @@
-package main
+package nsqd
 
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/bitly/go-nsq"
-	"github.com/bitly/nsq/util"
 	"log"
 	"net"
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/bitly/go-nsq"
+	"github.com/bitly/nsq/util"
 )
 
-func (n *NSQd) lookupLoop() {
-	syncTopicChan := make(chan *LookupPeer)
+func (n *NSQD) lookupLoop() {
+	syncTopicChan := make(chan *lookupPeer)
 
 	hostname, err := os.Hostname()
 	if err != nil {
 		log.Fatalf("ERROR: failed to get hostname - %s", err.Error())
 	}
 
-	for _, host := range n.lookupdTCPAddrs {
+	for _, host := range n.options.NSQLookupdTCPAddresses {
 		log.Printf("LOOKUP: adding peer %s", host)
-		lookupPeer := NewLookupPeer(host, func(lp *LookupPeer) {
+		lookupPeer := newLookupPeer(host, func(lp *lookupPeer) {
 			ci := make(map[string]interface{})
 			ci["version"] = util.BINARY_VERSION
 			ci["tcp_port"] = n.tcpAddr.Port
 			ci["http_port"] = n.httpAddr.Port
-			ci["address"] = hostname //TODO: drop for 1.0
 			ci["hostname"] = hostname
-			ci["broadcast_address"] = n.options.broadcastAddress
+			ci["broadcast_address"] = n.options.BroadcastAddress
 
 			cmd, err := nsq.Identify(ci)
 			if err != nil {
@@ -138,15 +138,9 @@ exit:
 	log.Printf("LOOKUP: closing")
 }
 
-func (n *NSQd) lookupHttpAddrs() []string {
+func (n *NSQD) lookupHttpAddrs() []string {
 	var lookupHttpAddrs []string
 	for _, lp := range n.lookupPeers {
-
-		//TODO: remove for 1.0
-		if len(lp.Info.BroadcastAddress) <= 0 {
-			lp.Info.BroadcastAddress = lp.Info.Address
-		}
-
 		if len(lp.Info.BroadcastAddress) <= 0 {
 			continue
 		}

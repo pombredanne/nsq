@@ -1,3 +1,7 @@
+package templates
+
+func init() {
+	registerTemplate("node.html", `
 {{template "header.html" .}}
 {{$g := .GraphOptions}}
 {{$node := .Node}}
@@ -48,12 +52,12 @@
         <table class="table table-condensed">
             <tr>
                 <td colspan="2"><strong>{{$numTopics}}</strong> Topics</td>
-                <td colspan="6"></td>
+                <td colspan="7"></td>
                 <td><strong>{{$numMessages}}</strong> Messages</td>
                 <td><strong>{{$numClients}}</strong> Clients</td>
             </tr>
             <tr>
-                <th colspan="2">Topic</th>
+                <th colspan="3">Topic</th>
                 <th>Depth</th>
                 <th>Memory + Disk</th>
                 <th colspan="4"></th>
@@ -61,7 +65,14 @@
                 <th>Channels</th>
             </tr>
             <tr class="info">
-                <td colspan="2"><a href="/tombstone_topic_producer?topic={{.TopicName}}&node={{$node}}&rd=/node/{{$node}}" class="red">✘</a> {{.TopicName}}</td>
+                <td colspan="3">
+                    <form class="form-inline" style="margin:0" action="/tombstone_topic_producer" method="POST">
+                        <input type="hidden" name="rd" value="/node/{{$node}}">
+                        <input type="hidden" name="topic" value="{{.TopicName}}">
+                        <input type="hidden" name="node" value="{{$node}}">
+                        <button class="btn btn-mini btn-link red" type="submit">✘</button> {{.TopicName}}
+                    </form>
+                </td>
                 <td>
                     {{if $g.Enabled}}<a href="{{$g.LargeGraph $t "depth"}}"><img width="120" src="{{$g.Sparkline $t "depth"}}"></a>{{end}}
                     {{.Depth | commafy}}</td>
@@ -83,7 +94,7 @@
             {{range $c := .Channels}}
             <tr>
                 <th width="25"></th>
-                <th>Channel</th>
+                <th colspan="2">Channel</th>
                 <th>Depth</th>
                 <th>Memory + Disk</th>
                 <th>In-Flight</th>
@@ -95,7 +106,7 @@
             </tr>
             <tr class="warning">
                 <td></td>
-                <td>
+                <td colspan="2">
                     {{$c.ChannelName}}
                     {{if $c.Paused}}<span class="label label-important">paused</span>{{end}}
                 </td>
@@ -124,6 +135,7 @@
                 <th></th>
                 <th>Client Host</th>
                 <th>Protocol</th>
+                <th>Attributes</th>
                 <th>NSQd Host</th>
                 <th>In-Flight</th>
                 <th>Ready Count</th>
@@ -135,8 +147,22 @@
             {{range .Clients}}
             <tr>
                 <td></td>
-                <td>{{.ClientIdentifier}}</td>
-                <td>{{.ClientVersion}}</td>
+                <td>{{.ClientID}}</td>
+                <td>{{.Version}} {{if .HasUserAgent}}({{.UserAgent}}){{end}}</td>
+                <td>
+                  {{if .HasSampleRate}}
+                  <span class="label label-info">Sampled {{.SampleRate}}%</span>
+                  {{end}}
+                  {{if .TLS}}
+                  <span class="label label-warning">TLS</span>
+                  {{end}}
+                  {{if .Deflate}}
+                  <span class="label label-default">Delfate</span>
+                  {{end}}
+                  {{if .Snappy}}
+                  <span class="label label-primary">Snappy</span>
+                  {{end}}
+                </td>
                 <td>{{.HostAddress}}</td>
                 <td>{{.InFlightCount | commafy}}</td>
                 <td>{{.ReadyCount | commafy}}</td>
@@ -156,3 +182,5 @@
 
 {{template "js.html" .}}
 {{template "footer.html" .}}
+`)
+}

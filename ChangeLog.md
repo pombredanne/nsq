@@ -2,6 +2,156 @@
 
 ## Binaries
 
+### 0.2.28 - 2014-04-28
+
+**Upgrading from 0.2.27**: No backwards incompatible changes.  We've deprecated the `short_id`
+and `long_id` options in the `IDENTIFY` command in favor of `client_id` and `hostname`, which
+more accurately reflect the data typically used.
+
+This release includes a few important new features, in particular enhanced `nsqd`
+TLS support thanks to a big contribution by @chrisroberts.
+
+You can now *require* that clients negotiate TLS with `--tls-required` and you can configure a
+client certificate policy via `--tls-client-auth-policy` (`require` or `require-verify`):
+
+ * `require` - the client must offer a certificate, otherwise rejected
+ * `require-verify` - the client must offer a valid certificate according to the default CA or
+                      the chain specified by `--tls-root-ca-file`, otherwise rejected
+
+This can be used as a form of client authentication.
+
+Additionally, `nsqd` is now structured such that it is importable in other Go applications
+via `github.com/bitly/nsq/nsqd`, thanks to @kzvezdarov.
+
+Finally, thanks to @paddyforan, `nsq_to_file` can now archive *multiple* topics or 
+optionally archive *all* discovered topics (by specifying no `--topic` params
+and using `--lookupd-http-address`).
+
+New Features / Enhancements:
+
+ * #334 - `nsq_to_file` can archive many topics (thanks @paddyforan)
+ * #327 - add `nsqd` TLS client certificate verification policy, ability
+          to require TLS, and HTTPS support (thanks @chrisroberts)
+ * #325 - make `nsqd` importable (`github.com/bitly/nsq/nsqd`) (thanks @kzvezdarov)
+ * #321 - improve `IDENTIFY` options (replace `short_id` and `long_id` with
+          `client_id` and `hostname`)
+ * #319 - allow path separator in `nsq_to_file` filenames (thanks @jsocol)
+ * #324 - display memory depth and total depth in `nsq_stat`
+
+Bug Fixes:
+
+ * bitly/go-nsq#19 and bitly/go-nsq#29 - fix deadlocks on `nsq.Reader` connection close/exit, this
+                                         impacts the utilities packaged with the NSQ binary
+                                         distribution such as `nsq_to_file`, `nsq_to_http`,
+                                         `nsq_to_nsq` and `nsq_tail`.
+ * #329 - use heartbeat interval for write deadline
+ * #321/#326 - improve benchmarking tests
+ * #315/#318 - fix test data races / flakiness
+
+### 0.2.27 - 2014-02-17
+
+**Upgrading from 0.2.26**: No backwards incompatible changes.  We deprecated `--max-message-size`
+in favor of `--max-msg-size` for consistency with the rest of the flag names.
+
+IMPORTANT: this is another quick bug-fix release to address an issue in `nsqadmin` where templates
+were incompatible with older versions of Go (pre-1.2).
+
+ * #306 - fix `nsqadmin` template compatibility (and formatting)
+ * #310 - fix `nsqadmin` behavior when E2E stats are disabled
+ * #309 - fix `nsqadmin` `INVALID_ERROR` on node page tombstone link
+ * #311/#312 - fix `nsqd` client metadata race condition and test flakiness
+ * #314 - fix `nsqd` test races (run w/ `-race` and `GOMAXPROCS=4`) deprecate `--max-message-size`
+
+### 0.2.26 - 2014-02-06
+
+**Upgrading from 0.2.25**: No backwards incompatible changes.
+
+IMPORTANT: this is a quick bug-fix release to address a regression identified in `0.2.25` where
+`statsd` prefixes were broken when using the default (or any) prefix that contained a `%s` for
+automatic host replacement.
+
+ * #303 - fix `nsqd` `--statsd-prefix` when using `%s` host replacement
+
+### 0.2.25 - 2014-02-05
+
+**Upgrading from 0.2.24**: No backwards incompatible changes.
+
+This release adds several commonly requested features.
+
+First, thanks to [@elubow](https://twitter.com/elubow) you can now configure your clients to sample
+the stream they're subscribed to. To read more about the details of the implementation see #286 and
+the original discussion in #223.  Eric also contributed an improvement to `nsq_tail` to add
+the ability to tail the last `N` messages and exit.
+
+We added config file support ([TOML](https://github.com/mojombo/toml/blob/master/README.md)) for
+`nsqd`, `nsqlookupd`, and `nsqadmin` - providing even more deployment flexibility. Example configs
+are in the `contrib` directory. Command line arguments override the equivalent option in the config
+file.
+
+We added the ability to pause a *topic* (it is already possible to pause individual *channels*).
+This functionality stops all message flow from topic to channel for *all channels* of a topic,
+queueing at the topic level. This enables all kinds of interesting possibilities like atomic
+channel renames and trivial infrastructure wide operations.
+
+Finally, we now compile the static assets used by `nsqadmin` into the binary, simplifying
+deployment.  This means that `--template-dir` is now deprecated and will be removed in a future
+release and you can remove the templates you previously deployed and maintained.
+
+New Features / Enhancements:
+
+ * #286 - add client `IDENTIFY` option to sample a % of messages
+ * #279 - add TOML config file support to `nsqd`, `nsqlookupd`, and `nsqadmin`
+ * #263 - add ability to pause a topic
+ * #291 - compile templates into `nsqadmin` binary
+ * #285/#288 - `nsq_tail` support for `-n #` to get recent # messages
+ * #287/#294 - display client `IDENTIFY` attributes in `nsqadmin` (sample rate, TLS, compression)
+ * #189/#296 - add client user agent to `nsqadmin``
+ * #297 - add `nsq_to_nsq` JSON message filtering options
+
+### 0.2.24 - 2013-12-07
+
+**Upgrading from 0.2.23**: No backwards incompatible changes. However, as you'll see below, quite a
+few command line flags to the utility apps (`nsq_to_http`, `nsq_to_file`, `nsq_to_http`) were
+deprecated and will be removed in the next release. Please use this release to transition over to
+the new ones.
+
+NOTE: we are now publishing additional binaries built against go1.2
+
+The most prominent addition is the tracking of end-to-end message processing percentiles. This
+measures the amount of time it's taking from `PUB` to `FIN` per topic/channel. The percentiles are
+configurable and, because there is *some* overhead in collecting this data, it can be turned off
+entirely. Please see [the section in the docs](http://nsq.io/components/nsqd.html) for
+implementation details.
+
+Additionally, the utility apps received comprehensive support for all configurable reader options
+(including compression, which was previously missing). This necessitated a bit of command line flag
+cleanup, as follows:
+
+#### nsq_to_file
+
+ * deprecated `--gzip-compression` in favor of `--gzip-level`
+ * deprecated `--verbose` in favor of `--reader-opt=verbose`
+
+#### nsq_to_http
+
+ * deprecated `--throttle-fraction` in favor of `--sample`
+ * deprecated `--http-timeout-ms` in favor of `--http-timeout` (which is a
+   *duration* flag)
+ * deprecated `--verbose` in favor of `--reader-opt=verbose`
+ * deprecated `--max-backoff-duration` in favor of
+   `--reader-opt=max_backoff_duration=X`
+
+#### nsq_to_nsq
+
+ * deprecated `--verbose` in favor of `--reader-opt=verbose`
+ * deprecated `--max-backoff-duration` in favor of
+   `--reader-opt=max_backoff_duration=X`
+
+New Features / Enhancements:
+
+ * #280 - add end-to-end message processing latency metrics
+ * #267 - comprehensive reader command line flags for utilities
+
 ### 0.2.23 - 2013-10-21
 
 **Upgrading from 0.2.22**: No backwards incompatible changes.

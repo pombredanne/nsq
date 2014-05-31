@@ -1,29 +1,38 @@
-package main
+package nsqlookupd
 
 import (
-	"github.com/bitly/nsq/util"
 	"log"
 	"net"
-	"time"
+
+	"github.com/bitly/nsq/util"
 )
 
 type NSQLookupd struct {
-	tcpAddr                 *net.TCPAddr
-	httpAddr                *net.TCPAddr
-	tcpListener             net.Listener
-	httpListener            net.Listener
-	broadcastAddress        string
-	waitGroup               util.WaitGroupWrapper
-	inactiveProducerTimeout time.Duration
-	tombstoneLifetime       time.Duration
-	DB                      *RegistrationDB
+	options      *nsqlookupdOptions
+	tcpAddr      *net.TCPAddr
+	httpAddr     *net.TCPAddr
+	tcpListener  net.Listener
+	httpListener net.Listener
+	waitGroup    util.WaitGroupWrapper
+	DB           *RegistrationDB
 }
 
-func NewNSQLookupd() *NSQLookupd {
+func NewNSQLookupd(options *nsqlookupdOptions) *NSQLookupd {
+	tcpAddr, err := net.ResolveTCPAddr("tcp", options.TCPAddress)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	httpAddr, err := net.ResolveTCPAddr("tcp", options.HTTPAddress)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	return &NSQLookupd{
-		inactiveProducerTimeout: 300 * time.Second,
-		tombstoneLifetime:       45 * time.Second,
-		DB:                      NewRegistrationDB(),
+		options:  options,
+		tcpAddr:  tcpAddr,
+		httpAddr: httpAddr,
+		DB:       NewRegistrationDB(),
 	}
 }
 
@@ -44,7 +53,7 @@ func (l *NSQLookupd) Main() {
 	}
 	l.httpListener = httpListener
 	httpServer := &httpServer{context: context}
-	l.waitGroup.Wrap(func() { util.HTTPServer(httpListener, httpServer) })
+	l.waitGroup.Wrap(func() { util.HTTPServer(httpListener, httpServer, "HTTP") })
 }
 
 func (l *NSQLookupd) Exit() {

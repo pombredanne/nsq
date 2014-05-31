@@ -4,75 +4,99 @@ package main
 
 import (
 	"compress/gzip"
-	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/bitly/go-nsq"
-	"github.com/bitly/nsq/util"
 	"log"
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/bitly/go-nsq"
+	"github.com/bitly/nsq/util"
+	"github.com/bitly/nsq/util/lookupd"
 )
 
 var (
-	datetimeFormat   = flag.String("datetime-format", "%Y-%m-%d_%H", "strftime compatible format for <DATETIME> in filename format")
-	filenameFormat   = flag.String("filename-format", "<TOPIC>.<HOST><GZIPREV>.<DATETIME>.log", "output filename format (<TOPIC>, <HOST>, <DATETIME>, <GZIPREV> are replaced. <GZIPREV> is a suffix when an existing gzip file already exists)")
-	showVersion      = flag.Bool("version", false, "print version string")
-	hostIdentifier   = flag.String("host-identifier", "", "value to output in log filename in place of hostname. <SHORT_HOST> and <HOSTNAME> are valid replacement tokens")
-	outputDir        = flag.String("output-dir", "/tmp", "directory to write output files to")
-	topic            = flag.String("topic", "", "nsq topic")
-	channel          = flag.String("channel", "nsq_to_file", "nsq channel")
-	maxInFlight      = flag.Int("max-in-flight", 1000, "max number of messages to allow in flight")
-	gzipCompression  = flag.Int("gzip-compression", 3, "gzip compression level. 1 BestSpeed, 2 BestCompression, 3 DefaultCompression")
-	gzipEnabled      = flag.Bool("gzip", false, "gzip output files.")
-	verbose          = flag.Bool("verbose", false, "verbose logging")
-	skipEmptyFiles   = flag.Bool("skip-empty-files", false, "Skip writting empty files")
+	showVersion = flag.Bool("version", false, "print version string")
+
+	channel     = flag.String("channel", "nsq_to_file", "nsq channel")
+	maxInFlight = flag.Int("max-in-flight", 200, "max number of messages to allow in flight")
+
+	outputDir      = flag.String("output-dir", "/tmp", "directory to write output files to")
+	datetimeFormat = flag.String("datetime-format", "%Y-%m-%d_%H", "strftime compatible format for <DATETIME> in filename format")
+	filenameFormat = flag.String("filename-format", "<TOPIC>.<HOST><GZIPREV>.<DATETIME>.log", "output filename format (<TOPIC>, <HOST>, <DATETIME>, <GZIPREV> are replaced. <GZIPREV> is a suffix when an existing gzip file already exists)")
+	hostIdentifier = flag.String("host-identifier", "", "value to output in log filename in place of hostname. <SHORT_HOST> and <HOSTNAME> are valid replacement tokens")
+	gzipLevel      = flag.Int("gzip-level", 6, "gzip compression level (1-9, 1=BestSpeed, 9=BestCompression)")
+	gzipEnabled    = flag.Bool("gzip", false, "gzip output files.")
+	skipEmptyFiles = flag.Bool("skip-empty-files", false, "Skip writting empty files")
+	topicPollRate  = flag.Duration("topic-refresh", time.Minute, "how frequently the topic list should be refreshed")
+
+	readerOpts       = util.StringArray{}
 	nsqdTCPAddrs     = util.StringArray{}
 	lookupdHTTPAddrs = util.StringArray{}
+	topics           = util.StringArray{}
 
-	tlsEnabled            = flag.Bool("tls", false, "enable TLS")
-	tlsInsecureSkipVerify = flag.Bool("tls-insecure-skip-verify", false, "disable TLS server certificate validation")
+	// TODO: remove, deprecated
+	gzipCompression = flag.Int("gzip-compression", 3, "(deprecated) use --gzip-level, gzip compression level (1 = BestSpeed, 2 = BestCompression, 3 = DefaultCompression)")
+	verbose         = flag.Bool("verbose", false, "(deprecated) use --reader-opt=verbose")
 )
 
 func init() {
+	flag.Var(&readerOpts, "reader-opt", "option to passthrough to nsq.Consumer (may be given multiple times)")
 	flag.Var(&nsqdTCPAddrs, "nsqd-tcp-address", "nsqd TCP address (may be given multiple times)")
 	flag.Var(&lookupdHTTPAddrs, "lookupd-http-address", "lookupd HTTP address (may be given multiple times)")
+	flag.Var(&topics, "topic", "nsq topic (may be given multiple times)")
 }
 
 type FileLogger struct {
 	out              *os.File
 	gzipWriter       *gzip.Writer
 	lastFilename     string
-	logChan          chan *Message
+	logChan          chan *nsq.Message
 	compressionLevel int
 	gzipEnabled      bool
 	filenameFormat   string
 
 	ExitChan chan int
+	termChan chan bool
+	hupChan  chan bool
 }
 
-type Message struct {
-	*nsq.Message
-	returnChannel chan *nsq.FinishedMessage
+type ReaderFileLogger struct {
+	F *FileLogger
+	R *nsq.Consumer
 }
 
-type SyncMsg struct {
-	m             *nsq.FinishedMessage
-	returnChannel chan *nsq.FinishedMessage
+type TopicDiscoverer struct {
+	topics   map[string]*ReaderFileLogger
+	termChan chan os.Signal
+	hupChan  chan os.Signal
+	wg       sync.WaitGroup
 }
 
-func (l *FileLogger) HandleMessage(m *nsq.Message, responseChannel chan *nsq.FinishedMessage) {
-	l.logChan <- &Message{m, responseChannel}
+func newTopicDiscoverer() *TopicDiscoverer {
+	return &TopicDiscoverer{
+		topics:   make(map[string]*ReaderFileLogger),
+		termChan: make(chan os.Signal),
+		hupChan:  make(chan os.Signal),
+	}
 }
 
-func (f *FileLogger) router(r *nsq.Reader, termChan chan os.Signal, hupChan chan os.Signal) {
+func (l *FileLogger) HandleMessage(m *nsq.Message) error {
+	m.DisableAutoResponse()
+	l.logChan <- m
+	return nil
+}
+
+func (f *FileLogger) router(r *nsq.Consumer) {
 	pos := 0
-	output := make([]*Message, *maxInFlight)
+	output := make([]*nsq.Message, *maxInFlight)
 	sync := false
 	ticker := time.NewTicker(time.Duration(30) * time.Second)
 	closing := false
@@ -81,16 +105,16 @@ func (f *FileLogger) router(r *nsq.Reader, termChan chan os.Signal, hupChan chan
 
 	for {
 		select {
-		case <-r.ExitChan:
+		case <-r.StopChan:
 			sync = true
 			closeFile = true
 			exit = true
-		case <-termChan:
+		case <-f.termChan:
 			ticker.Stop()
 			r.Stop()
 			sync = true
 			closing = true
-		case <-hupChan:
+		case <-f.hupChan:
 			sync = true
 			closeFile = true
 		case <-ticker.C:
@@ -116,7 +140,7 @@ func (f *FileLogger) router(r *nsq.Reader, termChan chan os.Signal, hupChan chan
 			}
 			output[pos] = m
 			pos++
-			if pos == *maxInFlight {
+			if pos == cap(output) {
 				sync = true
 			}
 		}
@@ -131,7 +155,7 @@ func (f *FileLogger) router(r *nsq.Reader, termChan chan os.Signal, hupChan chan
 				for pos > 0 {
 					pos--
 					m := output[pos]
-					m.returnChannel <- &nsq.FinishedMessage{m.Id, 0, true}
+					m.Finish()
 					output[pos] = nil
 				}
 			}
@@ -158,12 +182,14 @@ func (f *FileLogger) Close() {
 		f.out = nil
 	}
 }
+
 func (f *FileLogger) Write(p []byte) (n int, err error) {
 	if f.gzipWriter != nil {
 		return f.gzipWriter.Write(p)
 	}
 	return f.out.Write(p)
 }
+
 func (f *FileLogger) Sync() error {
 	var err error
 	if f.gzipWriter != nil {
@@ -198,7 +224,7 @@ func (f *FileLogger) updateFile() bool {
 	maxGzipRevisions := 1000
 	if filename != f.lastFilename || f.out == nil {
 		f.Close()
-		os.MkdirAll(*outputDir, 777)
+		os.MkdirAll(*outputDir, 0770)
 		var newFile *os.File
 		var err error
 		if f.gzipEnabled {
@@ -211,6 +237,13 @@ func (f *FileLogger) updateFile() bool {
 				}
 				tempFilename := strings.Replace(filename, "<GZIPREV>", revisionSuffix, -1)
 				fullPath := path.Join(*outputDir, tempFilename)
+				dir, _ := filepath.Split(fullPath)
+				if dir != "" {
+					err = os.MkdirAll(dir, 0770)
+					if err != nil {
+						log.Fatalf("ERROR: %s Unable to create %s", err, dir)
+					}
+				}
 				newFile, err = os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
 				if err != nil && os.IsExist(err) {
 					log.Printf("INFO: file already exists: %s", fullPath)
@@ -227,7 +260,15 @@ func (f *FileLogger) updateFile() bool {
 			}
 		} else {
 			log.Printf("opening %s/%s", *outputDir, filename)
-			newFile, err = os.OpenFile(path.Join(*outputDir, filename), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+			fullPath := path.Join(*outputDir, filename)
+			dir, _ := filepath.Split(fullPath)
+			if dir != "" {
+				err = os.MkdirAll(dir, 0770)
+				if err != nil {
+					log.Fatalf("ERROR: %s Unable to create %s", err, dir)
+				}
+			}
+			newFile, err = os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -244,17 +285,7 @@ func (f *FileLogger) updateFile() bool {
 	return false
 }
 
-func NewFileLogger(gzipEnabled bool, compressionLevel int, filenameFormat string) (*FileLogger, error) {
-	var speed int
-	switch compressionLevel {
-	case 1:
-		speed = gzip.BestSpeed
-	case 2:
-		speed = gzip.BestCompression
-	case 3:
-		speed = gzip.DefaultCompression
-	}
-
+func NewFileLogger(gzipEnabled bool, compressionLevel int, filenameFormat, topic string) (*FileLogger, error) {
 	if gzipEnabled && strings.Index(filenameFormat, "<GZIPREV>") == -1 {
 		return nil, errors.New("missing <GZIPREV> in filenameFormat")
 	}
@@ -269,20 +300,134 @@ func NewFileLogger(gzipEnabled bool, compressionLevel int, filenameFormat string
 		identifier = strings.Replace(*hostIdentifier, "<SHORT_HOST>", shortHostname, -1)
 		identifier = strings.Replace(identifier, "<HOSTNAME>", hostname, -1)
 	}
-	filenameFormat = strings.Replace(filenameFormat, "<TOPIC>", *topic, -1)
+	filenameFormat = strings.Replace(filenameFormat, "<TOPIC>", topic, -1)
 	filenameFormat = strings.Replace(filenameFormat, "<HOST>", identifier, -1)
 	if gzipEnabled && !strings.HasSuffix(filenameFormat, ".gz") {
 		filenameFormat = filenameFormat + ".gz"
 	}
 
 	f := &FileLogger{
-		logChan:          make(chan *Message, 1),
-		compressionLevel: speed,
+		logChan:          make(chan *nsq.Message, 1),
+		compressionLevel: compressionLevel,
 		filenameFormat:   filenameFormat,
 		gzipEnabled:      gzipEnabled,
 		ExitChan:         make(chan int),
+		termChan:         make(chan bool),
+		hupChan:          make(chan bool),
 	}
 	return f, nil
+}
+
+func hasArg(s string) bool {
+	for _, arg := range os.Args {
+		if strings.Contains(arg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+func newReaderFileLogger(topic string) (*ReaderFileLogger, error) {
+	f, err := NewFileLogger(*gzipEnabled, *gzipLevel, *filenameFormat, topic)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := nsq.NewConfig()
+	err = util.ParseReaderOpts(cfg, readerOpts)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Set("max_in_flight", *maxInFlight)
+
+	// TODO: remove, deprecated
+	if hasArg("verbose") {
+		log.Printf("WARNING: --verbose is deprecated in favor of --reader-opt=verbose")
+		cfg.Set("verbose", true)
+	}
+
+	r, err := nsq.NewConsumer(topic, *channel, cfg)
+	if err != nil {
+		return nil, err
+	}
+	r.SetLogger(log.New(os.Stderr, "", log.LstdFlags), nsq.LogLevelInfo)
+
+	r.SetHandler(f)
+
+	for _, addrString := range nsqdTCPAddrs {
+		err := r.ConnectToNSQD(addrString)
+		if err != nil {
+			log.Fatalf(err.Error())
+		}
+	}
+
+	for _, addrString := range lookupdHTTPAddrs {
+		log.Printf("lookupd addr %s", addrString)
+		err := r.ConnectToNSQLookupd(addrString)
+		if err != nil {
+			log.Fatalf(err.Error())
+		}
+	}
+
+	return &ReaderFileLogger{
+		R: r,
+		F: f,
+	}, nil
+}
+
+func (t *TopicDiscoverer) startTopicRouter(logger *ReaderFileLogger) {
+	t.wg.Add(1)
+	defer t.wg.Done()
+	go logger.F.router(logger.R)
+	<-logger.F.ExitChan
+}
+
+func (t *TopicDiscoverer) syncTopics(addrs []string) {
+	newTopics, err := lookupd.GetLookupdTopics(addrs)
+	if err != nil {
+		log.Print("ERROR: could not retrieve topic list: %s", err)
+	}
+	for _, topic := range newTopics {
+		if _, ok := t.topics[topic]; !ok {
+			logger, err := newReaderFileLogger(topic)
+			if err != nil {
+				log.Printf("ERROR: couldn't create logger for new topic %s: %s", topic, err.Error())
+				continue
+			}
+			t.topics[topic] = logger
+			go t.startTopicRouter(logger)
+		}
+	}
+}
+
+func (t *TopicDiscoverer) stopReaderFileLoggers() {
+	for _, topic := range t.topics {
+		topic.F.termChan <- true
+	}
+}
+
+func (t *TopicDiscoverer) hupReaderFileLoggers() {
+	for _, topic := range t.topics {
+		topic.F.hupChan <- true
+	}
+}
+
+func (t *TopicDiscoverer) watch(addrs []string, sync bool) {
+	ticker := time.Tick(*topicPollRate)
+	for {
+		select {
+		case <-ticker:
+			if sync {
+				t.syncTopics(addrs)
+			}
+		case <-t.termChan:
+			t.stopReaderFileLoggers()
+			t.wg.Wait()
+			return
+		case <-t.hupChan:
+			t.hupReaderFileLoggers()
+		}
+	}
 }
 
 func main() {
@@ -293,13 +438,11 @@ func main() {
 		return
 	}
 
-	if *topic == "" || *channel == "" {
-		log.Fatalf("--topic and --channel are required")
+	if *channel == "" {
+		log.Fatalf("--channel is required")
 	}
 
-	if *maxInFlight <= 0 {
-		log.Fatalf("--max-in-flight must be > 0")
-	}
+	var topicsFromNSQLookupd bool
 
 	if len(nsqdTCPAddrs) == 0 && len(lookupdHTTPAddrs) == 0 {
 		log.Fatalf("--nsqd-tcp-address or --lookupd-http-address required.")
@@ -308,51 +451,50 @@ func main() {
 		log.Fatalf("use --nsqd-tcp-address or --lookupd-http-address not both")
 	}
 
-	if *gzipCompression < 1 || *gzipCompression > 3 {
-		log.Fatalf("invalid --gzip-compresion value (%v). should be 1,2 or 3", *gzipCompression)
+	if *gzipLevel < 1 || *gzipLevel > 9 {
+		log.Fatalf("invalid --gzip-level value (%d), should be 1-9", *gzipLevel)
 	}
 
-	hupChan := make(chan os.Signal, 1)
-	termChan := make(chan os.Signal, 1)
-	signal.Notify(hupChan, syscall.SIGHUP)
-	signal.Notify(termChan, syscall.SIGINT, syscall.SIGTERM)
-
-	f, err := NewFileLogger(*gzipEnabled, *gzipCompression, *filenameFormat)
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-
-	r, err := nsq.NewReader(*topic, *channel)
-	if err != nil {
-		log.Fatalf(err.Error())
-	}
-	r.SetMaxInFlight(*maxInFlight)
-	r.VerboseLogging = *verbose
-
-	if *tlsEnabled {
-		r.TLSv1 = true
-		r.TLSConfig = &tls.Config{
-			InsecureSkipVerify: *tlsInsecureSkipVerify,
+	// TODO: remove, deprecated
+	if hasArg("gzip-compression") {
+		log.Printf("WARNING: --gzip-compression is deprecated in favor of --gzip-level")
+		switch *gzipCompression {
+		case 1:
+			*gzipLevel = gzip.BestSpeed
+		case 2:
+			*gzipLevel = gzip.BestCompression
+		case 3:
+			*gzipLevel = gzip.DefaultCompression
+		default:
+			log.Fatalf("invalid --gzip-compression value (%d), should be 1,2,3", *gzipCompression)
 		}
 	}
 
-	r.AddAsyncHandler(f)
-	go f.router(r, termChan, hupChan)
+	discoverer := newTopicDiscoverer()
 
-	for _, addrString := range nsqdTCPAddrs {
-		err := r.ConnectToNSQ(addrString)
+	signal.Notify(discoverer.hupChan, syscall.SIGHUP)
+	signal.Notify(discoverer.termChan, syscall.SIGINT, syscall.SIGTERM)
+
+	if len(topics) < 1 {
+		if len(lookupdHTTPAddrs) < 1 {
+			log.Fatalf("use --topic to list at least one topic to subscribe to or specify at least one --lookupd-http-address to subscribe to all its topics")
+		}
+		topicsFromNSQLookupd = true
+		var err error
+		topics, err = lookupd.GetLookupdTopics(lookupdHTTPAddrs)
 		if err != nil {
-			log.Fatalf(err.Error())
+			log.Fatalf("ERROR: could not retrieve topic list: %s", err)
 		}
 	}
 
-	for _, addrString := range lookupdHTTPAddrs {
-		log.Printf("lookupd addr %s", addrString)
-		err := r.ConnectToLookupd(addrString)
+	for _, topic := range topics {
+		logger, err := newReaderFileLogger(topic)
 		if err != nil {
-			log.Fatalf(err.Error())
+			log.Fatalf("ERROR: couldn't create logger for topic %s: %s", topic, err.Error())
 		}
+		discoverer.topics[topic] = logger
+		go discoverer.startTopicRouter(logger)
 	}
 
-	<-f.ExitChan
+	discoverer.watch(lookupdHTTPAddrs, topicsFromNSQLookupd)
 }

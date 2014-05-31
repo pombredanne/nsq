@@ -1,6 +1,10 @@
+package templates
+
+func init() {
+	registerTemplate("channel.html", `
 {{template "header.html" .}}
 {{$g := .GraphOptions}}
-{{$firstHost := index .ChannelStats.HostStats 0}}
+{{$firstHost := .FirstHost}}
 
 <ul class="breadcrumb">
   <li><a href="/">Streams</a> <span class="divider">/</span></li>
@@ -184,6 +188,7 @@
     <tr>
         <th>Client Host</th>
         <th>Protocol</th>
+        <th>Attributes</th>
         <th>NSQd Host</th>
         <th>In-Flight</th>
         <th>Ready Count</th>
@@ -195,8 +200,22 @@
 
 {{range .ChannelStats.Clients}}
     <tr>
-        <td>{{.ClientIdentifier}}</td>
-        <td>{{.ClientVersion}}</td>
+        <td>{{.ClientID}}</td>
+        <td>{{.Version}} {{if .HasUserAgent}}({{.UserAgent}}){{end}}</td>
+        <td>
+          {{if .HasSampleRate}}
+          <span class="label label-info">Sampled {{.SampleRate}}%</span>
+          {{end}}
+          {{if .TLS}}
+          <span class="label label-warning">TLS</span>
+          {{end}}
+          {{if .Deflate}}
+          <span class="label label-default">Delfate</span>
+          {{end}}
+          {{if .Snappy}}
+          <span class="label label-primary">Snappy</span>
+          {{end}}
+        </td>
         <td><a href="/node/{{.HostAddress}}">{{.HostAddress}}</a></td>
         <td>{{.InFlightCount | commafy}}</td>
         <td>{{.ReadyCount | commafy}}</td>
@@ -213,3 +232,5 @@
 
 {{template "js.html" .}}
 {{template "footer.html" .}}
+`)
+}

@@ -1,11 +1,13 @@
-package main
+package nsqlookupd
 
 import (
 	"fmt"
+
 	"github.com/bitly/go-nsq"
 	"github.com/bitly/nsq/util"
 	lookuputil "github.com/bitly/nsq/util/lookupd"
 	"github.com/bmizerany/assert"
+
 	"io/ioutil"
 	"log"
 	"net"
@@ -14,11 +16,11 @@ import (
 	"time"
 )
 
-func mustStartLookupd() (*net.TCPAddr, *net.TCPAddr, *NSQLookupd) {
+func mustStartLookupd(options *nsqlookupdOptions) (*net.TCPAddr, *net.TCPAddr, *NSQLookupd) {
 	tcpAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:0")
 	httpAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:0")
 
-	nsqlookupd := NewNSQLookupd()
+	nsqlookupd := NewNSQLookupd(options)
 	nsqlookupd.tcpAddr = tcpAddr
 	nsqlookupd.httpAddr = httpAddr
 	nsqlookupd.Main()
@@ -39,12 +41,11 @@ func identify(t *testing.T, conn net.Conn, address string, tcpPort int, httpPort
 	ci := make(map[string]interface{})
 	ci["tcp_port"] = tcpPort
 	ci["http_port"] = httpPort
-	ci["address"] = address //TODO: remove for 1.0
 	ci["broadcast_address"] = address
 	ci["hostname"] = address
 	ci["version"] = version
 	cmd, _ := nsq.Identify(ci)
-	err := cmd.Write(conn)
+	_, err := cmd.WriteTo(conn)
 	assert.Equal(t, err, nil)
 	_, err = nsq.ReadResponse(conn)
 	assert.Equal(t, err, nil)
@@ -54,7 +55,7 @@ func TestBasicLookupd(t *testing.T) {
 	log.SetOutput(ioutil.Discard)
 	defer log.SetOutput(os.Stdout)
 
-	tcpAddr, httpAddr, nsqlookupd := mustStartLookupd()
+	tcpAddr, httpAddr, nsqlookupd := mustStartLookupd(NewNSQLookupdOptions())
 	defer nsqlookupd.Exit()
 
 	topics := nsqlookupd.DB.FindRegistrations("topic", "*", "*")
@@ -67,7 +68,7 @@ func TestBasicLookupd(t *testing.T) {
 	httpPort := 5555
 	identify(t, conn, "ip.address", tcpPort, httpPort, "fake-version")
 
-	nsq.Register(topicName, "channel1").Write(conn)
+	nsq.Register(topicName, "channel1").WriteTo(conn)
 	v, err := nsq.ReadResponse(conn)
 	assert.Equal(t, err, nil)
 	assert.Equal(t, v, []byte("OK"))
@@ -86,7 +87,6 @@ func TestBasicLookupd(t *testing.T) {
 	assert.Equal(t, len(producers), 1)
 	producer := producers[0]
 
-	assert.Equal(t, producer.peerInfo.Address, "ip.address") //TODO: remove for 1.0
 	assert.Equal(t, producer.peerInfo.BroadcastAddress, "ip.address")
 	assert.Equal(t, producer.peerInfo.Hostname, "ip.address")
 	assert.Equal(t, producer.peerInfo.TcpPort, tcpPort)
@@ -114,19 +114,19 @@ func TestBasicLookupd(t *testing.T) {
 	for i := range returnedProducers {
 		producer := data.Get("producers").GetIndex(i)
 		log.Printf("producer %v", producer)
-		assert.Equal(t, err, nil)
+
 		port, err := producer.Get("tcp_port").Int()
 		assert.Equal(t, err, nil)
 		assert.Equal(t, port, tcpPort)
+
 		port, err = producer.Get("http_port").Int()
 		assert.Equal(t, err, nil)
 		assert.Equal(t, port, httpPort)
-		address, err := producer.Get("address").String() //TODO: remove for 1.0
-		broadcastaddress, err := producer.Get("broadcast_address").String()
 
+		broadcastaddress, err := producer.Get("broadcast_address").String()
 		assert.Equal(t, err, nil)
-		assert.Equal(t, address, "ip.address")
 		assert.Equal(t, broadcastaddress, "ip.address")
+
 		ver, err := producer.Get("version").String()
 		assert.Equal(t, err, nil)
 		assert.Equal(t, ver, "fake-version")
@@ -150,7 +150,7 @@ func TestChannelUnregister(t *testing.T) {
 	log.SetOutput(ioutil.Discard)
 	defer log.SetOutput(os.Stdout)
 
-	tcpAddr, httpAddr, nsqlookupd := mustStartLookupd()
+	tcpAddr, httpAddr, nsqlookupd := mustStartLookupd(NewNSQLookupdOptions())
 	defer nsqlookupd.Exit()
 
 	topics := nsqlookupd.DB.FindRegistrations("topic", "*", "*")
@@ -163,7 +163,7 @@ func TestChannelUnregister(t *testing.T) {
 	httpPort := 5555
 	identify(t, conn, "ip.address", tcpPort, httpPort, "fake-version")
 
-	nsq.Register(topicName, "ch1").Write(conn)
+	nsq.Register(topicName, "ch1").WriteTo(conn)
 	v, err := nsq.ReadResponse(conn)
 	assert.Equal(t, err, nil)
 	assert.Equal(t, v, []byte("OK"))
@@ -174,7 +174,7 @@ func TestChannelUnregister(t *testing.T) {
 	channels := nsqlookupd.DB.FindRegistrations("channel", topicName, "*")
 	assert.Equal(t, len(channels), 1)
 
-	nsq.UnRegister(topicName, "ch1").Write(conn)
+	nsq.UnRegister(topicName, "ch1").WriteTo(conn)
 	v, err = nsq.ReadResponse(conn)
 	assert.Equal(t, err, nil)
 	assert.Equal(t, v, []byte("OK"))
@@ -199,9 +199,10 @@ func TestTombstoneRecover(t *testing.T) {
 	log.SetOutput(ioutil.Discard)
 	defer log.SetOutput(os.Stdout)
 
-	tcpAddr, httpAddr, nsqlookupd := mustStartLookupd()
+	options := NewNSQLookupdOptions()
+	options.TombstoneLifetime = 50 * time.Millisecond
+	tcpAddr, httpAddr, nsqlookupd := mustStartLookupd(options)
 	defer nsqlookupd.Exit()
-	nsqlookupd.tombstoneLifetime = 50 * time.Millisecond
 
 	topicName := "tombstone_recover"
 	topicName2 := topicName + "2"
@@ -209,11 +210,11 @@ func TestTombstoneRecover(t *testing.T) {
 	conn := mustConnectLookupd(t, tcpAddr)
 	identify(t, conn, "ip.address", 5000, 5555, "fake-version")
 
-	nsq.Register(topicName, "channel1").Write(conn)
+	nsq.Register(topicName, "channel1").WriteTo(conn)
 	_, err := nsq.ReadResponse(conn)
 	assert.Equal(t, err, nil)
 
-	nsq.Register(topicName2, "channel2").Write(conn)
+	nsq.Register(topicName2, "channel2").WriteTo(conn)
 	_, err = nsq.ReadResponse(conn)
 	assert.Equal(t, err, nil)
 
@@ -246,16 +247,17 @@ func TestTombstoneUnregister(t *testing.T) {
 	log.SetOutput(ioutil.Discard)
 	defer log.SetOutput(os.Stdout)
 
-	tcpAddr, httpAddr, nsqlookupd := mustStartLookupd()
+	options := NewNSQLookupdOptions()
+	options.TombstoneLifetime = 50 * time.Millisecond
+	tcpAddr, httpAddr, nsqlookupd := mustStartLookupd(options)
 	defer nsqlookupd.Exit()
-	nsqlookupd.tombstoneLifetime = 50 * time.Millisecond
 
 	topicName := "tombstone_unregister"
 
 	conn := mustConnectLookupd(t, tcpAddr)
 	identify(t, conn, "ip.address", 5000, 5555, "fake-version")
 
-	nsq.Register(topicName, "channel1").Write(conn)
+	nsq.Register(topicName, "channel1").WriteTo(conn)
 	_, err := nsq.ReadResponse(conn)
 	assert.Equal(t, err, nil)
 
@@ -269,7 +271,7 @@ func TestTombstoneUnregister(t *testing.T) {
 	producers, _ := data.Get("producers").Array()
 	assert.Equal(t, len(producers), 0)
 
-	nsq.UnRegister(topicName, "").Write(conn)
+	nsq.UnRegister(topicName, "").WriteTo(conn)
 	_, err = nsq.ReadResponse(conn)
 	assert.Equal(t, err, nil)
 
@@ -286,9 +288,10 @@ func TestInactiveNodes(t *testing.T) {
 	log.SetOutput(ioutil.Discard)
 	defer log.SetOutput(os.Stdout)
 
-	tcpAddr, httpAddr, nsqlookupd := mustStartLookupd()
+	options := NewNSQLookupdOptions()
+	options.InactiveProducerTimeout = 50 * time.Millisecond
+	tcpAddr, httpAddr, nsqlookupd := mustStartLookupd(options)
 	defer nsqlookupd.Exit()
-	nsqlookupd.inactiveProducerTimeout = 50 * time.Millisecond
 
 	lookupdHTTPAddrs := []string{fmt.Sprintf("%s", httpAddr)}
 
@@ -297,7 +300,7 @@ func TestInactiveNodes(t *testing.T) {
 	conn := mustConnectLookupd(t, tcpAddr)
 	identify(t, conn, "ip.address", 5000, 5555, "fake-version")
 
-	nsq.Register(topicName, "channel1").Write(conn)
+	nsq.Register(topicName, "channel1").WriteTo(conn)
 	_, err := nsq.ReadResponse(conn)
 	assert.Equal(t, err, nil)
 
@@ -317,9 +320,10 @@ func TestTombstonedNodes(t *testing.T) {
 	log.SetOutput(ioutil.Discard)
 	defer log.SetOutput(os.Stdout)
 
-	tcpAddr, httpAddr, nsqlookupd := mustStartLookupd()
+	options := NewNSQLookupdOptions()
+	options.InactiveProducerTimeout = 50 * time.Millisecond
+	tcpAddr, httpAddr, nsqlookupd := mustStartLookupd(options)
 	defer nsqlookupd.Exit()
-	nsqlookupd.inactiveProducerTimeout = 50 * time.Millisecond
 
 	lookupdHTTPAddrs := []string{fmt.Sprintf("%s", httpAddr)}
 
@@ -328,7 +332,7 @@ func TestTombstonedNodes(t *testing.T) {
 	conn := mustConnectLookupd(t, tcpAddr)
 	identify(t, conn, "ip.address", 5000, 5555, "fake-version")
 
-	nsq.Register(topicName, "channel1").Write(conn)
+	nsq.Register(topicName, "channel1").WriteTo(conn)
 	_, err := nsq.ReadResponse(conn)
 	assert.Equal(t, err, nil)
 

@@ -1,27 +1,29 @@
-package main
+package nsqd
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/bitly/go-nsq"
-	"github.com/bitly/go-simplejson"
-	"github.com/bitly/nsq/util"
-	"github.com/bitly/nsq/util/lookupd"
 	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"path"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/bitly/go-simplejson"
+	"github.com/bitly/nsq/util"
+	"github.com/bitly/nsq/util/lookupd"
 )
 
-type NSQd struct {
+type NSQD struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
-	workerId         int64
 	clientIDSequence int64
 
 	sync.RWMutex
@@ -30,120 +32,66 @@ type NSQd struct {
 
 	topicMap map[string]*Topic
 
-	lookupdTCPAddrs util.StringArray
-	lookupPeers     []*LookupPeer
+	lookupPeers []*lookupPeer
 
-	tcpAddr      *net.TCPAddr
-	httpAddr     *net.TCPAddr
-	tcpListener  net.Listener
-	httpListener net.Listener
-	tlsConfig    *tls.Config
+	tcpAddr       *net.TCPAddr
+	httpAddr      *net.TCPAddr
+	httpsAddr     *net.TCPAddr
+	tcpListener   net.Listener
+	httpListener  net.Listener
+	httpsListener net.Listener
+	tlsConfig     *tls.Config
 
-	idChan     chan nsq.MessageID
+	idChan     chan MessageID
 	notifyChan chan interface{}
 	exitChan   chan int
 	waitGroup  util.WaitGroupWrapper
 }
 
-type nsqdOptions struct {
-	// basic options
-	broadcastAddress string
+func NewNSQD(options *nsqdOptions) *NSQD {
+	var httpsAddr *net.TCPAddr
 
-	// diskqueue options
-	dataPath        string
-	memQueueSize    int64
-	maxBytesPerFile int64
-	syncEvery       int64
-	syncTimeout     time.Duration
-
-	// msg and command options
-	msgTimeout     time.Duration
-	maxMsgTimeout  time.Duration
-	maxMessageSize int64
-	maxBodySize    int64
-	clientTimeout  time.Duration
-
-	// client overridable configuration options
-	maxHeartbeatInterval   time.Duration
-	maxRdyCount            int64
-	maxOutputBufferSize    int64
-	maxOutputBufferTimeout time.Duration
-
-	// statsd integration
-	statsdAddress  string
-	statsdPrefix   string
-	statsdInterval time.Duration
-
-	// e2e message latency
-	e2eProcessingLatencyWindowTime  time.Duration
-	e2eProcessingLatencyPercentiles []float64
-
-	// TLS config
-	tlsCert string
-	tlsKey  string
-
-	// compression
-	deflateEnabled  bool
-	maxDeflateLevel int
-	snappyEnabled   bool
-}
-
-func NewNsqdOptions() *nsqdOptions {
-	return &nsqdOptions{
-		broadcastAddress: "",
-
-		dataPath:        os.TempDir(),
-		memQueueSize:    10000,
-		maxBytesPerFile: 104857600,
-		syncEvery:       2500,
-		syncTimeout:     2 * time.Second,
-
-		msgTimeout:     60 * time.Second,
-		maxMsgTimeout:  15 * time.Minute,
-		maxMessageSize: 1024768,
-		maxBodySize:    5 * 1024768,
-		clientTimeout:  nsq.DefaultClientTimeout,
-
-		maxHeartbeatInterval:   60 * time.Second,
-		maxRdyCount:            2500,
-		maxOutputBufferSize:    64 * 1024,
-		maxOutputBufferTimeout: 1 * time.Second,
-
-		statsdAddress:  "",
-		statsdPrefix:   "",
-		statsdInterval: 60 * time.Second,
-
-		e2eProcessingLatencyWindowTime: time.Duration(10 * time.Minute),
-
-		tlsCert: "",
-		tlsKey:  "",
-
-		deflateEnabled:  true,
-		maxDeflateLevel: -1,
-		snappyEnabled:   true,
+	if options.MaxDeflateLevel < 1 || options.MaxDeflateLevel > 9 {
+		log.Fatalf("--max-deflate-level must be [1,9]")
 	}
-}
 
-func NewNSQd(workerId int64, options *nsqdOptions) *NSQd {
-	n := &NSQd{
-		workerId:   workerId,
+	tcpAddr, err := net.ResolveTCPAddr("tcp", options.TCPAddress)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	httpAddr, err := net.ResolveTCPAddr("tcp", options.HTTPAddress)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if options.HTTPSAddress != "" {
+		httpsAddr, err = net.ResolveTCPAddr("tcp", options.HTTPSAddress)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	if options.StatsdPrefix != "" {
+		statsdHostKey := util.StatsdHostKey(net.JoinHostPort(options.BroadcastAddress,
+			strconv.Itoa(httpAddr.Port)))
+		prefixWithHost := strings.Replace(options.StatsdPrefix, "%s", statsdHostKey, -1)
+		if prefixWithHost[len(prefixWithHost)-1] != '.' {
+			prefixWithHost += "."
+		}
+		options.StatsdPrefix = prefixWithHost
+	}
+
+	n := &NSQD{
 		options:    options,
+		tcpAddr:    tcpAddr,
+		httpAddr:   httpAddr,
+		httpsAddr:  httpsAddr,
 		topicMap:   make(map[string]*Topic),
-		idChan:     make(chan nsq.MessageID, 4096),
+		idChan:     make(chan MessageID, 4096),
 		exitChan:   make(chan int),
 		notifyChan: make(chan interface{}),
-	}
-
-	if options.tlsCert != "" || options.tlsKey != "" {
-		cert, err := tls.LoadX509KeyPair(options.tlsCert, options.tlsKey)
-		if err != nil {
-			log.Fatalf("ERROR: failed to LoadX509KeyPair %s", err.Error())
-		}
-		n.tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			ClientAuth:   tls.VerifyClientCertIfGiven,
-		}
-		n.tlsConfig.BuildNameToCertificate()
+		tlsConfig:  buildTLSConfig(options),
 	}
 
 	n.waitGroup.Wrap(func() { n.idPump() })
@@ -151,8 +99,19 @@ func NewNSQd(workerId int64, options *nsqdOptions) *NSQd {
 	return n
 }
 
-func (n *NSQd) Main() {
-	context := &Context{n}
+func (n *NSQD) Main() {
+	var httpListener net.Listener
+	var httpsListener net.Listener
+
+	context := &context{n}
+
+	if n.options.TLSClientAuthPolicy != "" {
+		n.options.TLSRequired = true
+	}
+
+	if n.tlsConfig == nil && n.options.TLSRequired {
+		log.Fatalf("FATAL: cannot require TLS client connections without TLS key and cert")
+	}
 
 	n.waitGroup.Wrap(func() { n.lookupLoop() })
 
@@ -164,21 +123,38 @@ func (n *NSQd) Main() {
 	tcpServer := &tcpServer{context: context}
 	n.waitGroup.Wrap(func() { util.TCPServer(n.tcpListener, tcpServer) })
 
-	httpListener, err := net.Listen("tcp", n.httpAddr.String())
+	if n.tlsConfig != nil && n.httpsAddr != nil {
+		httpsListener, err = tls.Listen("tcp", n.httpsAddr.String(), n.tlsConfig)
+		if err != nil {
+			log.Fatalf("FATAL: listen (%s) failed - %s", n.httpsAddr, err.Error())
+		}
+		n.httpsListener = httpsListener
+		httpsServer := &httpServer{
+			context:     context,
+			tlsEnabled:  true,
+			tlsRequired: true,
+		}
+		n.waitGroup.Wrap(func() { util.HTTPServer(n.httpsListener, httpsServer, "HTTPS") })
+	}
+	httpListener, err = net.Listen("tcp", n.httpAddr.String())
 	if err != nil {
 		log.Fatalf("FATAL: listen (%s) failed - %s", n.httpAddr, err.Error())
 	}
 	n.httpListener = httpListener
-	httpServer := &httpServer{context: context}
-	n.waitGroup.Wrap(func() { util.HTTPServer(n.httpListener, httpServer) })
+	httpServer := &httpServer{
+		context:     context,
+		tlsEnabled:  false,
+		tlsRequired: n.options.TLSRequired,
+	}
+	n.waitGroup.Wrap(func() { util.HTTPServer(n.httpListener, httpServer, "HTTP") })
 
-	if n.options.statsdAddress != "" {
+	if n.options.StatsdAddress != "" {
 		n.waitGroup.Wrap(func() { n.statsdLoop() })
 	}
 }
 
-func (n *NSQd) LoadMetadata() {
-	fn := fmt.Sprintf(path.Join(n.options.dataPath, "nsqd.%d.dat"), n.workerId)
+func (n *NSQD) LoadMetadata() {
+	fn := fmt.Sprintf(path.Join(n.options.DataPath, "nsqd.%d.dat"), n.options.ID)
 	data, err := ioutil.ReadFile(fn)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -207,11 +183,16 @@ func (n *NSQd) LoadMetadata() {
 			log.Printf("ERROR: failed to parse metadata - %s", err.Error())
 			return
 		}
-		if !nsq.IsValidTopicName(topicName) {
+		if !util.IsValidTopicName(topicName) {
 			log.Printf("WARNING: skipping creation of invalid topic %s", topicName)
 			continue
 		}
 		topic := n.GetTopic(topicName)
+
+		paused, _ := topicJs.Get("paused").Bool()
+		if paused {
+			topic.Pause()
+		}
 
 		channels, err := topicJs.Get("channels").Array()
 		if err != nil {
@@ -227,13 +208,13 @@ func (n *NSQd) LoadMetadata() {
 				log.Printf("ERROR: failed to parse metadata - %s", err.Error())
 				return
 			}
-			if !nsq.IsValidChannelName(channelName) {
+			if !util.IsValidChannelName(channelName) {
 				log.Printf("WARNING: skipping creation of invalid channel %s", channelName)
 				continue
 			}
 			channel := topic.GetChannel(channelName)
 
-			paused, _ := channelJs.Get("paused").Bool()
+			paused, _ = channelJs.Get("paused").Bool()
 			if paused {
 				channel.Pause()
 			}
@@ -241,10 +222,10 @@ func (n *NSQd) LoadMetadata() {
 	}
 }
 
-func (n *NSQd) PersistMetadata() error {
+func (n *NSQD) PersistMetadata() error {
 	// persist metadata about what topics/channels we have
 	// so that upon restart we can get back to the same state
-	fileName := fmt.Sprintf(path.Join(n.options.dataPath, "nsqd.%d.dat"), n.workerId)
+	fileName := fmt.Sprintf(path.Join(n.options.DataPath, "nsqd.%d.dat"), n.options.ID)
 	log.Printf("NSQ: persisting topic/channel metadata to %s", fileName)
 
 	js := make(map[string]interface{})
@@ -252,6 +233,7 @@ func (n *NSQd) PersistMetadata() error {
 	for _, topic := range n.topicMap {
 		topicData := make(map[string]interface{})
 		topicData["name"] = topic.name
+		topicData["paused"] = topic.IsPaused()
 		channels := make([]interface{}, 0)
 		topic.Lock()
 		for _, channel := range topic.channelMap {
@@ -290,7 +272,7 @@ func (n *NSQd) PersistMetadata() error {
 	f.Sync()
 	f.Close()
 
-	err = os.Rename(tmpFileName, fileName)
+	err = atomic_rename(tmpFileName, fileName)
 	if err != nil {
 		return err
 	}
@@ -298,13 +280,17 @@ func (n *NSQd) PersistMetadata() error {
 	return nil
 }
 
-func (n *NSQd) Exit() {
+func (n *NSQD) Exit() {
 	if n.tcpListener != nil {
 		n.tcpListener.Close()
 	}
 
 	if n.httpListener != nil {
 		n.httpListener.Close()
+	}
+
+	if n.httpsListener != nil {
+		n.httpsListener.Close()
 	}
 
 	n.Lock()
@@ -326,14 +312,14 @@ func (n *NSQd) Exit() {
 
 // GetTopic performs a thread safe operation
 // to return a pointer to a Topic object (potentially new)
-func (n *NSQd) GetTopic(topicName string) *Topic {
+func (n *NSQD) GetTopic(topicName string) *Topic {
 	n.Lock()
 	t, ok := n.topicMap[topicName]
 	if ok {
 		n.Unlock()
 		return t
 	} else {
-		t = NewTopic(topicName, &Context{n})
+		t = NewTopic(topicName, &context{n})
 		n.topicMap[topicName] = t
 
 		log.Printf("TOPIC(%s): created", t.name)
@@ -367,7 +353,7 @@ func (n *NSQd) GetTopic(topicName string) *Topic {
 }
 
 // GetExistingTopic gets a topic only if it exists
-func (n *NSQd) GetExistingTopic(topicName string) (*Topic, error) {
+func (n *NSQD) GetExistingTopic(topicName string) (*Topic, error) {
 	n.RLock()
 	defer n.RUnlock()
 	topic, ok := n.topicMap[topicName]
@@ -378,7 +364,7 @@ func (n *NSQd) GetExistingTopic(topicName string) (*Topic, error) {
 }
 
 // DeleteExistingTopic removes a topic only if it exists
-func (n *NSQd) DeleteExistingTopic(topicName string) error {
+func (n *NSQD) DeleteExistingTopic(topicName string) error {
 	n.RLock()
 	topic, ok := n.topicMap[topicName]
 	if !ok {
@@ -402,10 +388,11 @@ func (n *NSQd) DeleteExistingTopic(topicName string) error {
 	return nil
 }
 
-func (n *NSQd) idPump() {
+func (n *NSQD) idPump() {
+	factory := &guidFactory{}
 	lastError := time.Now()
 	for {
-		id, err := NewGUID(n.workerId)
+		id, err := factory.NewGUID(n.options.ID)
 		if err != nil {
 			now := time.Now()
 			if now.Sub(lastError) > time.Second {
@@ -427,7 +414,7 @@ exit:
 	log.Printf("ID: closing")
 }
 
-func (n *NSQd) Notify(v interface{}) {
+func (n *NSQD) Notify(v interface{}) {
 	// by selecting on exitChan we guarantee that
 	// we do not block exit, see issue #123
 	select {
@@ -440,4 +427,48 @@ func (n *NSQd) Notify(v interface{}) {
 		}
 		n.Unlock()
 	}
+}
+
+func buildTLSConfig(options *nsqdOptions) *tls.Config {
+	var tlsConfig *tls.Config
+
+	if options.TLSCert == "" && options.TLSKey == "" {
+		return nil
+	}
+
+	tlsClientAuthPolicy := tls.VerifyClientCertIfGiven
+
+	cert, err := tls.LoadX509KeyPair(options.TLSCert, options.TLSKey)
+	if err != nil {
+		log.Fatalf("ERROR: failed to LoadX509KeyPair %s", err.Error())
+	}
+	switch options.TLSClientAuthPolicy {
+	case "require":
+		tlsClientAuthPolicy = tls.RequireAnyClientCert
+	case "require-verify":
+		tlsClientAuthPolicy = tls.RequireAndVerifyClientCert
+	default:
+		tlsClientAuthPolicy = tls.NoClientCert
+	}
+
+	tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tlsClientAuthPolicy,
+	}
+
+	if options.TLSRootCAFile != "" {
+		tlsCertPool := x509.NewCertPool()
+		ca_cert_file, err := ioutil.ReadFile(options.TLSRootCAFile)
+		if err != nil {
+			log.Fatalf("ERROR: failed to read custom Certificate Authority file %s", err.Error())
+		}
+		if !tlsCertPool.AppendCertsFromPEM(ca_cert_file) {
+			log.Fatalf("ERROR: failed to append certificates from Certificate Authority file")
+		}
+		tlsConfig.ClientCAs = tlsCertPool
+	}
+
+	tlsConfig.BuildNameToCertificate()
+
+	return tlsConfig
 }

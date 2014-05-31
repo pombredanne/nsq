@@ -1,8 +1,6 @@
-package main
+package nsqd
 
 import (
-	"github.com/bitly/go-nsq"
-	"github.com/bmizerany/assert"
 	"io/ioutil"
 	"log"
 	"os"
@@ -10,13 +8,15 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/bmizerany/assert"
 )
 
 func TestGetTopic(t *testing.T) {
 	log.SetOutput(ioutil.Discard)
 	defer log.SetOutput(os.Stdout)
 
-	nsqd := NewNSQd(1, NewNsqdOptions())
+	_, _, nsqd := mustStartNSQD(NewNSQDOptions())
 	defer nsqd.Exit()
 
 	topic1 := nsqd.GetTopic("test")
@@ -35,7 +35,7 @@ func TestGetChannel(t *testing.T) {
 	log.SetOutput(ioutil.Discard)
 	defer log.SetOutput(os.Stdout)
 
-	nsqd := NewNSQd(1, NewNsqdOptions())
+	_, _, nsqd := mustStartNSQD(NewNSQDOptions())
 	defer nsqd.Exit()
 
 	topic := nsqd.GetTopic("test")
@@ -54,7 +54,7 @@ func TestDeletes(t *testing.T) {
 	log.SetOutput(ioutil.Discard)
 	defer log.SetOutput(os.Stdout)
 
-	nsqd := NewNSQd(1, NewNsqdOptions())
+	_, _, nsqd := mustStartNSQD(NewNSQDOptions())
 	defer nsqd.Exit()
 
 	topic := nsqd.GetTopic("test")
@@ -79,7 +79,7 @@ func TestDeleteLast(t *testing.T) {
 	log.SetOutput(ioutil.Discard)
 	defer log.SetOutput(os.Stdout)
 
-	nsqd := NewNSQd(1, NewNsqdOptions())
+	_, _, nsqd := mustStartNSQD(NewNSQDOptions())
 	defer nsqd.Exit()
 
 	topic := nsqd.GetTopic("test")
@@ -91,11 +91,44 @@ func TestDeleteLast(t *testing.T) {
 	assert.Equal(t, nil, err)
 	assert.Equal(t, 0, len(topic.channelMap))
 
-	msg := nsq.NewMessage(<-nsqd.idChan, []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+	msg := NewMessage(<-nsqd.idChan, []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaa"))
 	err = topic.PutMessage(msg)
 	time.Sleep(100 * time.Millisecond)
 	assert.Equal(t, nil, err)
 	assert.Equal(t, topic.Depth(), int64(1))
+}
+
+func TestPause(t *testing.T) {
+	log.SetOutput(ioutil.Discard)
+	defer log.SetOutput(os.Stdout)
+
+	_, _, nsqd := mustStartNSQD(NewNSQDOptions())
+	defer nsqd.Exit()
+
+	topicName := "test_topic_pause" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	err := topic.Pause()
+	assert.Equal(t, err, nil)
+
+	channel := topic.GetChannel("ch1")
+	assert.NotEqual(t, channel, nil)
+
+	msg := NewMessage(<-nsqd.idChan, []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+	err = topic.PutMessage(msg)
+	assert.Equal(t, err, nil)
+
+	time.Sleep(15 * time.Millisecond)
+
+	assert.Equal(t, topic.Depth(), int64(1))
+	assert.Equal(t, channel.Depth(), int64(0))
+
+	err = topic.UnPause()
+	assert.Equal(t, err, nil)
+
+	time.Sleep(15 * time.Millisecond)
+
+	assert.Equal(t, topic.Depth(), int64(0))
+	assert.Equal(t, channel.Depth(), int64(1))
 }
 
 func BenchmarkTopicPut(b *testing.B) {
@@ -103,15 +136,15 @@ func BenchmarkTopicPut(b *testing.B) {
 	log.SetOutput(ioutil.Discard)
 	defer log.SetOutput(os.Stdout)
 	topicName := "bench_topic_put" + strconv.Itoa(b.N)
-	options := NewNsqdOptions()
-	options.memQueueSize = int64(b.N)
-	nsqd := NewNSQd(1, options)
+	options := NewNSQDOptions()
+	options.MemQueueSize = int64(b.N)
+	_, _, nsqd := mustStartNSQD(options)
 	defer nsqd.Exit()
 	b.StartTimer()
 
 	for i := 0; i <= b.N; i++ {
 		topic := nsqd.GetTopic(topicName)
-		msg := nsq.NewMessage(<-nsqd.idChan, []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+		msg := NewMessage(<-nsqd.idChan, []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaa"))
 		topic.PutMessage(msg)
 	}
 }
@@ -122,16 +155,16 @@ func BenchmarkTopicToChannelPut(b *testing.B) {
 	defer log.SetOutput(os.Stdout)
 	topicName := "bench_topic_to_channel_put" + strconv.Itoa(b.N)
 	channelName := "bench"
-	options := NewNsqdOptions()
-	options.memQueueSize = int64(b.N)
-	nsqd := NewNSQd(1, options)
+	options := NewNSQDOptions()
+	options.MemQueueSize = int64(b.N)
+	_, _, nsqd := mustStartNSQD(options)
 	defer nsqd.Exit()
 	channel := nsqd.GetTopic(topicName).GetChannel(channelName)
 	b.StartTimer()
 
 	for i := 0; i <= b.N; i++ {
 		topic := nsqd.GetTopic(topicName)
-		msg := nsq.NewMessage(<-nsqd.idChan, []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+		msg := NewMessage(<-nsqd.idChan, []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaa"))
 		topic.PutMessage(msg)
 	}
 

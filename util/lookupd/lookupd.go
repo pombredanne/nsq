@@ -3,14 +3,15 @@ package lookupd
 import (
 	"errors"
 	"fmt"
-	"github.com/bitly/nsq/util"
-	"github.com/bitly/nsq/util/semver"
 	"log"
 	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bitly/nsq/util"
+	"github.com/bitly/nsq/util/semver"
 )
 
 // GetLookupdTopics returns a []string containing a union of all the topics
@@ -115,12 +116,8 @@ func GetLookupdProducers(lookupdHTTPAddrs []string) ([]*Producer, error) {
 				if remoteAddress == "" {
 					remoteAddress = "NA"
 				}
-				address := producer.Get("address").MustString() //TODO: remove for 1.0
 				hostname := producer.Get("hostname").MustString()
 				broadcastAddress := producer.Get("broadcast_address").MustString()
-				if broadcastAddress == "" {
-					broadcastAddress = address
-				}
 				httpPort := producer.Get("http_port").MustInt()
 				tcpPort := producer.Get("tcp_port").MustInt()
 				key := fmt.Sprintf("%s:%d:%d", broadcastAddress, httpPort, tcpPort)
@@ -159,7 +156,6 @@ func GetLookupdProducers(lookupdHTTPAddrs []string) ([]*Producer, error) {
 					}
 
 					p = &Producer{
-						Address:          address, //TODO: remove for 1.0
 						Hostname:         hostname,
 						BroadcastAddress: broadcastAddress,
 						TcpPort:          tcpPort,
@@ -216,11 +212,7 @@ func GetLookupdTopicProducers(topic string, lookupdHTTPAddrs []string) ([]string
 			producersArray, _ := producers.Array()
 			for i := range producersArray {
 				producer := producers.GetIndex(i)
-				address := producer.Get("address").MustString() //TODO: remove for 1.0
 				broadcastAddress := producer.Get("broadcast_address").MustString()
-				if broadcastAddress == "" {
-					broadcastAddress = address
-				}
 				httpPort := producer.Get("http_port").MustInt()
 				key := fmt.Sprintf("%s:%d", broadcastAddress, httpPort)
 				allSources = util.StringAdd(allSources, key)
@@ -361,6 +353,7 @@ func GetNSQDStats(nsqdHTTPAddrs []string, selectedTopic string) ([]*TopicStats, 
 					MemoryDepth:  depth - backendDepth,
 					MessageCount: t.Get("message_count").MustInt64(),
 					ChannelCount: len(channels),
+					Paused:       t.Get("paused").MustBool(),
 
 					E2eProcessingLatency: e2eProcessingLatency,
 				}
@@ -418,20 +411,37 @@ func GetNSQDStats(nsqdHTTPAddrs []string, selectedTopic string) ([]*TopicStats, 
 						connected := time.Unix(client.Get("connect_ts").MustInt64(), 0)
 						connectedDuration := time.Now().Sub(connected).Seconds()
 
-						clientInfo := &ClientInfo{
-							HostAddress:   addr,
-							ClientVersion: client.Get("version").MustString(),
-							ClientIdentifier: fmt.Sprintf("%s:%s", client.Get("name").MustString(),
-								strings.Split(client.Get("remote_address").MustString(), ":")[1]),
+						clientId := client.Get("clientId").MustString()
+						if clientId == "" {
+							// TODO: deprecated, remove in 1.0
+							name := client.Get("name").MustString()
+							remoteAddressParts := strings.Split(client.Get("remote_address").MustString(), ":")
+							port := remoteAddressParts[len(remoteAddressParts)-1]
+							if len(remoteAddressParts) < 2 {
+								port = "NA"
+							}
+							clientId = fmt.Sprintf("%s:%s", name, port)
+						}
+
+						clientStats := &ClientStats{
+							HostAddress:       addr,
+							Version:           client.Get("version").MustString(),
+							ClientID:          clientId,
+							Hostname:          client.Get("hostname").MustString(),
+							UserAgent:         client.Get("user_agent").MustString(),
 							ConnectedDuration: time.Duration(int64(connectedDuration)) * time.Second, // truncate to second
 							InFlightCount:     client.Get("in_flight_count").MustInt(),
 							ReadyCount:        client.Get("ready_count").MustInt(),
 							FinishCount:       client.Get("finish_count").MustInt64(),
 							RequeueCount:      client.Get("requeue_count").MustInt64(),
 							MessageCount:      client.Get("message_count").MustInt64(),
+							SampleRate:        int32(client.Get("sample_rate").MustInt()),
+							TLS:               client.Get("tls").MustBool(),
+							Deflate:           client.Get("deflate").MustBool(),
+							Snappy:            client.Get("snappy").MustBool(),
 						}
-						hostChannelStats.Clients = append(hostChannelStats.Clients, clientInfo)
-						channelStats.Clients = append(channelStats.Clients, clientInfo)
+						hostChannelStats.Clients = append(hostChannelStats.Clients, clientStats)
+						channelStats.Clients = append(channelStats.Clients, clientStats)
 					}
 					sort.Sort(ClientsByHost{hostChannelStats.Clients})
 					sort.Sort(ClientsByHost{channelStats.Clients})

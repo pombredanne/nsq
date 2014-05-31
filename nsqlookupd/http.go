@@ -1,12 +1,12 @@
-package main
+package nsqlookupd
 
 import (
 	"fmt"
-	"github.com/bitly/go-nsq"
-	"github.com/bitly/nsq/util"
 	"io"
 	"log"
 	"net/http"
+
+	"github.com/bitly/nsq/util"
 )
 
 type httpServer struct {
@@ -97,7 +97,8 @@ func (s *httpServer) lookupHandler(w http.ResponseWriter, req *http.Request) {
 
 	channels := s.context.nsqlookupd.DB.FindRegistrations("channel", topicName, "*").SubKeys()
 	producers := s.context.nsqlookupd.DB.FindProducers("topic", topicName, "")
-	producers = producers.FilterByActive(s.context.nsqlookupd.inactiveProducerTimeout, s.context.nsqlookupd.tombstoneLifetime)
+	producers = producers.FilterByActive(s.context.nsqlookupd.options.InactiveProducerTimeout,
+		s.context.nsqlookupd.options.TombstoneLifetime)
 	data := make(map[string]interface{})
 	data["channels"] = channels
 	data["producers"] = producers.PeerInfo()
@@ -118,7 +119,7 @@ func (s *httpServer) createTopicHandler(w http.ResponseWriter, req *http.Request
 		return
 	}
 
-	if !nsq.IsValidTopicName(topicName) {
+	if !util.IsValidTopicName(topicName) {
 		util.ApiResponse(w, 500, "INVALID_TOPIC", nil)
 		return
 	}
@@ -243,7 +244,6 @@ func (s *httpServer) deleteChannelHandler(w http.ResponseWriter, req *http.Reque
 // note: we can't embed the *Producer here because embeded objects are ignored for json marshalling
 type node struct {
 	RemoteAddress    string   `json:"remote_address"`
-	Address          string   `json:"address"` //TODO: drop for 1.0
 	Hostname         string   `json:"hostname"`
 	BroadcastAddress string   `json:"broadcast_address"`
 	TcpPort          int      `json:"tcp_port"`
@@ -255,7 +255,8 @@ type node struct {
 
 func (s *httpServer) nodesHandler(w http.ResponseWriter, req *http.Request) {
 	// dont filter out tombstoned nodes
-	producers := s.context.nsqlookupd.DB.FindProducers("client", "", "").FilterByActive(s.context.nsqlookupd.inactiveProducerTimeout, 0)
+	producers := s.context.nsqlookupd.DB.FindProducers("client", "", "").FilterByActive(
+		s.context.nsqlookupd.options.InactiveProducerTimeout, 0)
 	nodes := make([]*node, len(producers))
 	for i, p := range producers {
 		topics := s.context.nsqlookupd.DB.LookupRegistrations(p.peerInfo.id).Filter("topic", "*", "").Keys()
@@ -267,14 +268,13 @@ func (s *httpServer) nodesHandler(w http.ResponseWriter, req *http.Request) {
 			topicProducers := s.context.nsqlookupd.DB.FindProducers("topic", t, "")
 			for _, tp := range topicProducers {
 				if tp.peerInfo == p.peerInfo {
-					tombstones[j] = tp.IsTombstoned(s.context.nsqlookupd.tombstoneLifetime)
+					tombstones[j] = tp.IsTombstoned(s.context.nsqlookupd.options.TombstoneLifetime)
 				}
 			}
 		}
 
 		nodes[i] = &node{
 			RemoteAddress:    p.peerInfo.RemoteAddress,
-			Address:          p.peerInfo.Address, //TODO: drop for 1.0
 			Hostname:         p.peerInfo.Hostname,
 			BroadcastAddress: p.peerInfo.BroadcastAddress,
 			TcpPort:          p.peerInfo.TcpPort,
@@ -309,7 +309,6 @@ func (s *httpServer) debugHandler(w http.ResponseWriter, req *http.Request) {
 		for _, p := range producers {
 			m := make(map[string]interface{})
 			m["id"] = p.peerInfo.id
-			m["address"] = p.peerInfo.Address //TODO: remove for 1.0
 			m["hostname"] = p.peerInfo.Hostname
 			m["broadcast_address"] = p.peerInfo.BroadcastAddress
 			m["tcp_port"] = p.peerInfo.TcpPort

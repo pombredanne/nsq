@@ -1,8 +1,9 @@
-package main
+package nsqd
 
 import (
-	"github.com/bitly/nsq/util"
 	"sort"
+
+	"github.com/bitly/nsq/util"
 )
 
 type TopicStats struct {
@@ -11,6 +12,7 @@ type TopicStats struct {
 	Depth        int64          `json:"depth"`
 	BackendDepth int64          `json:"backend_depth"`
 	MessageCount uint64         `json:"message_count"`
+	Paused       bool           `json:"paused"`
 
 	E2eProcessingLatency *util.PercentileResult `json:"e2e_processing_latency"`
 }
@@ -22,6 +24,7 @@ func NewTopicStats(t *Topic, channels []ChannelStats) TopicStats {
 		Depth:        t.Depth(),
 		BackendDepth: t.backend.Depth(),
 		MessageCount: t.messageCount,
+		Paused:       t.IsPaused(),
 
 		E2eProcessingLatency: t.AggregateChannelE2eProcessingLatency().PercentileResult(),
 	}
@@ -60,9 +63,13 @@ func NewChannelStats(c *Channel, clients []ClientStats) ChannelStats {
 }
 
 type ClientStats struct {
+	// TODO: deprecated, remove in 1.0
+	Name string `json:"name"`
+
+	ClientID      string `json:"client_id"`
+	Hostname      string `json:"hostname"`
 	Version       string `json:"version"`
 	RemoteAddress string `json:"remote_address"`
-	Name          string `json:"name"`
 	State         int32  `json:"state"`
 	ReadyCount    int64  `json:"ready_count"`
 	InFlightCount int64  `json:"in_flight_count"`
@@ -70,6 +77,11 @@ type ClientStats struct {
 	FinishCount   uint64 `json:"finish_count"`
 	RequeueCount  uint64 `json:"requeue_count"`
 	ConnectTime   int64  `json:"connect_ts"`
+	SampleRate    int32  `json:"sample_rate"`
+	TLS           bool   `json:"tls"`
+	Deflate       bool   `json:"deflate"`
+	Snappy        bool   `json:"snappy"`
+	UserAgent     string `json:"user_agent"`
 }
 
 type Topics []*Topic
@@ -94,7 +106,7 @@ type ChannelsByName struct {
 
 func (c ChannelsByName) Less(i, j int) bool { return c.Channels[i].name < c.Channels[j].name }
 
-func (n *NSQd) getStats() []TopicStats {
+func (n *NSQD) GetStats() []TopicStats {
 	n.RLock()
 	defer n.RUnlock()
 

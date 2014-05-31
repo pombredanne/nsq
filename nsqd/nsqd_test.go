@@ -1,10 +1,7 @@
-package main
+package nsqd
 
 import (
 	"fmt"
-	"github.com/bitly/go-nsq"
-	"github.com/bitly/go-simplejson"
-	"github.com/bmizerany/assert"
 	"io/ioutil"
 	"log"
 	"os"
@@ -12,10 +9,13 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/bitly/go-simplejson"
+	"github.com/bmizerany/assert"
 )
 
-func getMetadata(n *NSQd) (*simplejson.Json, error) {
-	fn := fmt.Sprintf(path.Join(n.options.dataPath, "nsqd.%d.dat"), n.workerId)
+func getMetadata(n *NSQD) (*simplejson.Json, error) {
+	fn := fmt.Sprintf(path.Join(n.options.DataPath, "nsqd.%d.dat"), n.options.ID)
 	data, err := ioutil.ReadFile(fn)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -39,10 +39,10 @@ func TestStartup(t *testing.T) {
 	iterations := 300
 	doneExitChan := make(chan int)
 
-	options := NewNsqdOptions()
-	options.memQueueSize = 100
-	options.maxBytesPerFile = 10240
-	_, _, nsqd := mustStartNSQd(options)
+	options := NewNSQDOptions()
+	options.MemQueueSize = 100
+	options.MaxBytesPerFile = 10240
+	_, _, nsqd := mustStartNSQD(options)
 
 	topicName := "nsqd_test" + strconv.Itoa(int(time.Now().Unix()))
 
@@ -65,7 +65,7 @@ func TestStartup(t *testing.T) {
 	body := make([]byte, 256)
 	topic := nsqd.GetTopic(topicName)
 	for i := 0; i < iterations; i++ {
-		msg := nsq.NewMessage(<-nsqd.idChan, body)
+		msg := NewMessage(<-nsqd.idChan, body)
 		topic.PutMessage(msg)
 	}
 
@@ -101,10 +101,10 @@ func TestStartup(t *testing.T) {
 
 	// start up a new nsqd w/ the same folder
 
-	options = NewNsqdOptions()
-	options.memQueueSize = 100
-	options.maxBytesPerFile = 10240
-	_, _, nsqd = mustStartNSQd(options)
+	options = NewNSQDOptions()
+	options.MemQueueSize = 100
+	options.MaxBytesPerFile = 10240
+	_, _, nsqd = mustStartNSQD(options)
 
 	go func() {
 		<-exitChan
@@ -147,9 +147,9 @@ func TestEphemeralChannel(t *testing.T) {
 	log.SetOutput(ioutil.Discard)
 	defer log.SetOutput(os.Stdout)
 
-	options := NewNsqdOptions()
-	options.memQueueSize = 100
-	_, _, nsqd := mustStartNSQd(options)
+	options := NewNSQDOptions()
+	options.MemQueueSize = 100
+	_, _, nsqd := mustStartNSQD(options)
 
 	topicName := "ephemeral_test" + strconv.Itoa(int(time.Now().Unix()))
 	doneExitChan := make(chan int)
@@ -164,10 +164,10 @@ func TestEphemeralChannel(t *testing.T) {
 	body := []byte("an_ephemeral_message")
 	topic := nsqd.GetTopic(topicName)
 	ephemeralChannel := topic.GetChannel("ch1#ephemeral")
-	client := NewClientV2(0, nil, &Context{nsqd})
+	client := newClientV2(0, nil, &context{nsqd})
 	ephemeralChannel.AddClient(client.ID, client)
 
-	msg := nsq.NewMessage(<-nsqd.idChan, body)
+	msg := NewMessage(<-nsqd.idChan, body)
 	topic.PutMessage(msg)
 	msg = <-ephemeralChannel.clientMsgChan
 	assert.Equal(t, msg.Body, body)
@@ -177,12 +177,16 @@ func TestEphemeralChannel(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	assert.Equal(t, len(topic.channelMap), 0)
+	topic.Lock()
+	numChannels := len(topic.channelMap)
+	topic.Unlock()
+	assert.Equal(t, numChannels, 0)
+
 	exitChan <- 1
 	<-doneExitChan
 }
 
-func metadataForChannel(n *NSQd, topicIndex int, channelIndex int) *simplejson.Json {
+func metadataForChannel(n *NSQD, topicIndex int, channelIndex int) *simplejson.Json {
 	metadata, _ := getMetadata(n)
 	mChannels := metadata.Get("topics").GetIndex(topicIndex).Get("channels")
 	return mChannels.GetIndex(channelIndex)
@@ -192,8 +196,8 @@ func TestPauseMetadata(t *testing.T) {
 	log.SetOutput(ioutil.Discard)
 	defer log.SetOutput(os.Stdout)
 
-	options := NewNsqdOptions()
-	_, _, nsqd := mustStartNSQd(options)
+	options := NewNSQDOptions()
+	_, _, nsqd := mustStartNSQD(options)
 
 	topicName := "pause_metadata" + strconv.Itoa(int(time.Now().Unix()))
 	topic := nsqd.GetTopic(topicName)

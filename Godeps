@@ -10,13 +10,17 @@
 			"Rev": "12e4b4183793ac4b061921e7980845e750679fd0"
 		},
 		{
+			"ImportPath": "github.com/BurntSushi/toml",
+			"Rev": "2dff11163ee667d51dcc066660925a92ce138deb"
+		},
+		{
 			"ImportPath": "github.com/bitly/go-hostpool",
 			"Rev": "58b95b10d6ca26723a7f46017b348653b825a8d6"
 		},
 		{
 			"ImportPath": "github.com/bitly/go-nsq",
-			"Comment": "v0.3.3",
-			"Rev": "97ea060927af3af0ad2c25debf94014a22e891ca"
+			"Comment": "v1.0.0-alpha",
+			"Rev": "84426ed57253477fb15db9fd741837e519a9f72c"
 		},
 		{
 			"ImportPath": "github.com/bitly/go-simplejson",
@@ -29,7 +33,7 @@
 		},
 		{
 			"ImportPath": "github.com/bmizerany/perks/quantile",
-			"Rev": "da72989a59aaaecda7110926d3a6198ee4421c1f"
+			"Rev": "6cb9d9d729303ee2628580d9aec5db968da3a607"
 		},
 		{
 			"ImportPath": "github.com/kr/pretty",
@@ -38,6 +42,10 @@
 		{
 			"ImportPath": "github.com/kr/text",
 			"Rev": "6807e777504f54ad073ecef66747de158294b639"
+		},
+		{
+			"ImportPath": "github.com/mreiferson/go-options",
+			"Rev": "896a539cd709f4f39d787562d1583c016ce7517e"
 		},
 		{
 			"ImportPath": "github.com/mreiferson/go-snappystream",

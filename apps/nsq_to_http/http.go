@@ -3,17 +3,16 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"github.com/bitly/go-nsq"
-	"github.com/bitly/nsq/util"
 	"net/http"
-	"time"
+
+	"github.com/bitly/nsq/util"
 )
 
 var httpclient *http.Client
 var userAgent string
 
 func init() {
-	httpclient = &http.Client{Transport: nsq.NewDeadlineTransport(time.Duration(*httpTimeoutMs) * time.Millisecond)}
+	httpclient = &http.Client{Transport: util.NewDeadlineTransport(*httpTimeout)}
 	userAgent = fmt.Sprintf("nsq_to_http v%s", util.BINARY_VERSION)
 }
 
